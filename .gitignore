@@ -1,0 +1,15 @@
+# Build artifacts (rebuilt by the release pipeline)
+dist/
+build/
+*.egg-info/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# OS
+.DS_Store

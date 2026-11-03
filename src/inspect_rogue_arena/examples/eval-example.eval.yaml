@@ -1,0 +1,27 @@
+# Inspect run config for a published Rogue Arena model eval.
+#
+# Inspect has no YAML task format, so the task (a react agent with a bash
+# tool, scored by rogue_arena_hops()) lives in eval_example.py; this file
+# picks the eval and sizes the run. Copy this file and eval_example.py out of
+# the installed package (or a source checkout) into a directory, then:
+#
+#   export ROGUE_ARENA_BASE_URL=https://arena.roguelabs.io
+#   export ROGUE_ARENA_TOKEN=ra_eval_...    # personal token; never commit it
+#   rogue-arena-inspect evals               # environmentId, name, stage count
+#   inspect eval --run-config eval-example.eval.yaml --model <provider>/<model>
+#
+# Replace the `eval` placeholder with an environmentId or a unique name from
+# `rogue-arena-inspect evals` (left as is, the run fails naming it). It wins
+# over ROGUE_ARENA_EVAL. To pick the eval from the environment instead, run
+# the task file directly:
+#
+#   ROGUE_ARENA_EVAL=<environmentId> inspect eval eval_example.py --model <provider>/<model>
+task: eval_example.py
+sandbox:
+  type: rogue-arena
+  config:
+    eval: <environmentId or name from rogue-arena-inspect evals>
+    max_wait_seconds: 900
+    max_runtime_seconds: 3600
+    max_trials: 1
+    concurrency: 1

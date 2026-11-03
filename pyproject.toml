@@ -1,0 +1,87 @@
+[project]
+name = "inspect-rogue-arena"
+version = "0.4.0"
+description = "Inspect sandbox provider for running AI model evals on Rogue Arena cyber ranges"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Rogue Labs", email = "info@roguelabs.io" }]
+license = "Apache-2.0"
+# LICENSE and NOTICE ship in both the sdist and the wheel (the wheel carries
+# them under .dist-info/licenses/).
+license-files = ["LICENSE", "NOTICE"]
+keywords = ["inspect", "inspect_ai", "evals", "sandbox", "rogue-arena", "security"]
+# No "License ::" classifier: with an SPDX `license` expression it is redundant
+# and rejected by the PEP 639 metadata backend.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Security",
+]
+dependencies = [
+    # imported directly: shielded close/cancel scopes (Inspect runs on anyio)
+    "anyio>=4.0",
+    "httpx>=0.27",
+    # 0.3.260 ships SandboxUnavailableError and OutputLimitExceededError, which
+    # the sandbox raises (it also passes the reserved __sample_id__, from 0.3.206).
+    # Supported Inspect versions: >=0.3.260,<0.3.274.
+    "inspect_ai>=0.3.260,<0.3.274",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+# Model-provider client libraries, so a provider's deps come with the extra:
+#   pip install -e '.[openrouter]'
+# Inspect's `openrouter/...` provider is OpenAI-compatible and uses the openai
+# client, so [openrouter] installs openai.
+openrouter = ["openai>=1.0"]
+openai = ["openai>=1.0"]
+anthropic = ["anthropic>=0.40"]
+google = ["google-genai>=1.0"]
+# Everything above, for a team run that mixes providers.
+all-providers = ["openai>=1.0", "anthropic>=0.40", "google-genai>=1.0"]
+
+[dependency-groups]
+# test-only: tests/test_sandbox.py parses the example run config with PyYAML.
+# `uv sync` installs it.
+dev = ["pyyaml>=6"]
+
+[project.urls]
+Homepage = "https://github.com/rogue-labs-cyber/inspect-rogue-arena"
+Repository = "https://github.com/rogue-labs-cyber/inspect-rogue-arena"
+Issues = "https://github.com/rogue-labs-cyber/inspect-rogue-arena/issues"
+"Rogue Arena" = "https://arena.roguelabs.io"
+
+[project.scripts]
+rogue-arena-inspect = "inspect_rogue_arena.cli:main"
+
+[project.entry-points."inspect_ai"]
+"rogue-arena" = "inspect_rogue_arena.sandbox"
+
+[build-system]
+# Pinned so a CI build reproduces the release build exactly.
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# The whole package ships, including the py.typed marker and the example task
+# files and configs under inspect_rogue_arena/examples/.
+packages = ["src/inspect_rogue_arena"]
+
+# The sdist ships the package (with its examples and py.typed marker), the
+# tests, the README, LICENSE, NOTICE and this pyproject. The build backend also
+# adds the project's .gitignore.
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/inspect_rogue_arena",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "pyproject.toml",
+]

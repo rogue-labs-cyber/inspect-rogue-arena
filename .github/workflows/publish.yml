@@ -1,0 +1,75 @@
+name: Publish to PyPI
+
+# Publishes inspect-rogue-arena to PyPI on a version tag, using PyPI Trusted
+# Publishing (OIDC). There is no API token: PyPI trusts this exact workflow
+# (publish.yml) running in the "pypi" environment of this repository.
+#
+# Actions are pinned by commit SHA (the version is in the trailing comment).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install and run the test suite
+        run: |
+          python -m pip install --upgrade pip pyyaml
+          python -m pip install -e '.[all-providers]'
+          python -m unittest discover -s tests
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    # Must match the Trusted Publisher configured on PyPI for this project.
+    environment: pypi
+    permissions:
+      id-token: write # OIDC token for Trusted Publishing; no password/API token
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag matches the package version
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          with open("pyproject.toml", "rb") as fh:
+              version = tomllib.load(fh)["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          expected = f"v{version}"
+          if tag != expected:
+              raise SystemExit(f"tag {tag} does not match package version ({expected})")
+          print(f"tag {tag} matches version {version}")
+          PY
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Publish to PyPI (Trusted Publishing / OIDC)
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        # No `with: password:`. Trusted Publishing mints a short-lived OIDC
+        # token from the `id-token: write` permission and the `pypi` environment.
