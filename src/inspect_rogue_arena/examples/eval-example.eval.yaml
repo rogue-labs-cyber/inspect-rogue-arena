@@ -21,7 +21,8 @@ sandbox:
   type: rogue-arena
   config:
     eval: <environmentId or name from rogue-arena-inspect evals>
-    max_wait_seconds: 900
+    # Each trial's wall clock, provisioning included: raise it for a large
+    # scenario whose cold build takes a large share of an hour.
     max_runtime_seconds: 3600
     max_trials: 1
     concurrency: 1

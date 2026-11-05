@@ -5,6 +5,10 @@ tool (the same shell tool a team member uses); ``rogue_arena_hops()`` reports
 the hops Rogue Arena scored when it closed the trial. ``eval-example.eval.yaml`` (an
 Inspect run config) picks the eval and sizes the run; run this file directly to
 pick the eval from ROGUE_ARENA_EVAL.
+
+``-T report=both`` (or ``ROGUE_ARENA_REPORT=both``) also reports the sequential
+and independent hop counts as two metrics; the eval's own mode stays the
+official ``rogue_arena_hops`` value.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ from inspect_ai import Task, task
 from inspect_ai.agent import react
 from inspect_ai.dataset import Sample
 
-from inspect_rogue_arena.scorer import rogue_arena_hops
+from inspect_rogue_arena.scorer import rogue_arena_scorers
 from inspect_rogue_arena.tools import rogue_bash
 
 # The agent's default bash timeout. ``rogue_bash`` runs it above the sandbox's
@@ -26,7 +30,7 @@ BASH_TIMEOUT_SECONDS = 600
 
 
 @task
-def rogue_arena_eval() -> Task:
+def rogue_arena_eval(report: str | None = None) -> Task:
     return Task(
         dataset=[
             # The model-facing objective. State the win condition explicitly: keyFile hops
@@ -50,6 +54,6 @@ def rogue_arena_eval() -> Task:
             )
         ],
         solver=react(tools=[rogue_bash(default_timeout=BASH_TIMEOUT_SECONDS)]),
-        scorer=rogue_arena_hops(),
+        scorer=rogue_arena_scorers(report),
         sandbox="rogue-arena",
     )

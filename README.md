@@ -104,11 +104,14 @@ is in development.
   not from Rogue Arena. Check the provider API key and that the model is
   permitted for your account and region. `launch` prints a clean line pointing
   here instead of a raw provider stack trace.
-- **A trial won't start (`TrialReadyTimeout`, or a claim refused with `409`).**
-  No warm copy and no free deployment/concurrency slot right now. `evals` shows
-  each eval's launch readiness (`ready now (N warm)` vs `on demand, ~X min`);
-  wait for a build, lower `concurrency`, or retry when a slot frees. A `402`
-  funding denial means the eval could not be funded for your organization.
+- **A trial won't start (`TrialClosedBeforeReady`, `TrialReadyTimeout`, or a
+  claim refused with `409`).** `TrialClosedBeforeReady` means Rogue Arena ended
+  the trial while building its range; the message carries Rogue Arena's reason.
+  If the message says the trial's wall clock ran out, raise `--max-runtime`
+  (see [Large scenarios](#large-scenarios)). A `409` means no free
+  deployment/concurrency slot right now: lower `concurrency`, or retry when a
+  slot frees. A `402` funding denial means the eval could not be funded for
+  your organization.
 
 ## What the client sends to Rogue Arena
 
@@ -205,6 +208,8 @@ rogue-arena-inspect launch --eval <id> --model <provider>/<model>  # built-in ex
 rogue-arena-inspect launch --eval <id> --task my_task.py --model … # your own task
 rogue-arena-inspect launch --team team.yaml --eval <id>            # a multi-agent team
 rogue-arena-inspect launch --eval <id> --model … --max-runtime 1800 # per-trial wall clock (s)
+rogue-arena-inspect launch --eval <id> --model … --report both      # sequential and independent counts
+rogue-arena-inspect launch --eval <id> --model … --parallel 4       # 4 trials at once
 ```
 
 `launch` is a thin wrapper around `inspect eval`. It resolves the built-in
@@ -212,7 +217,9 @@ example task (shipped inside the package), sets `ROGUE_ARENA_EVAL`, keeps the
 token in the environment (never on the child argv), and runs `inspect eval`.
 Anything after `--` is passed straight through to `inspect eval` (e.g.
 `-- --limit 1`). `--max-runtime SECONDS` sets the per-trial wall clock (60 to
-86400).
+86400). `--report both` also reports the sequential and independent hop counts;
+see [Both scoring modes](#both-scoring-modes-reportboth). `--parallel N` runs N
+trials at once; see [Parallel runs](#parallel-runs-launch---parallel-n).
 
 ### Provider errors
 
@@ -322,8 +329,8 @@ a key any member surfaced.
 | `eval` | `ROGUE_ARENA_EVAL` | none (required) | The eval to run: an `environmentId`, or a `name` that matches exactly one eval. An id match wins; an unknown or ambiguous selector is an error. |
 | `max_trials` | `ROGUE_ARENA_MAX_TRIALS` | `10000` | The job's `n`: the most trials the job admits. Set it to at least samples × epochs plus retries. |
 | `concurrency` | `ROGUE_ARENA_CONCURRENCY` | `2` | The job's `concurrency`: the most trials open at once. |
-| `max_runtime_seconds` | `ROGUE_ARENA_MAX_RUNTIME_SECONDS` | `3600` (60 to 86400) | Each trial's wall clock, counted from its claim, provisioning included. |
-| `max_wait_seconds` | `ROGUE_ARENA_MAX_WAIT_SECONDS` | `900` | How long a claimed trial may take to become `ready`. |
+| `max_runtime_seconds` | `ROGUE_ARENA_MAX_RUNTIME_SECONDS` | `3600` (60 to 86400) | Each trial's wall clock, counted from its claim, provisioning included. Raise it for a large scenario; see [Large scenarios](#large-scenarios). |
+| `max_wait_seconds` | `ROGUE_ARENA_MAX_WAIT_SECONDS` | 2 hours, or `max_runtime_seconds` plus 5 minutes if longer | The backstop on a trial's range build. The provider waits while Rogue Arena reports the build in progress, and Rogue Arena ends a stalled build itself; the default only bounds a wait that never ends. |
 | `heartbeat_interval_seconds` | `ROGUE_ARENA_HEARTBEAT_INTERVAL_SECONDS` | `300` | Lease heartbeat cadence (must be under 900). |
 | `sync_exec_ceiling_seconds` | `ROGUE_ARENA_SYNC_EXEC_CEILING_SECONDS` | `50` (at most 55) | The longest command timeout that runs as one synchronous request. |
 | `poll_interval_seconds` | `ROGUE_ARENA_POLL_INTERVAL_SECONDS` | `2` (at most 60) | Cadence of the ready, close and background-exec polls. |
@@ -345,8 +352,9 @@ sample**:
    its own idempotency key: a transport failure or a 502/503/504 resends the
    claim once and Rogue Arena answers the trial it already opened, never a
    second one. A claim can return a trial still `provisioning`; the provider
-   polls it to `ready` within `max_wait_seconds`, and cancels it if anything
-   fails.
+   polls it for as long as Rogue Arena reports it `provisioning`, up to the
+   `max_wait_seconds` backstop, and cancels it if anything fails before it is
+   `ready`. See [Large scenarios](#large-scenarios).
 3. **Heartbeat.** A background task heartbeats the trial every
    `heartbeat_interval_seconds` until the wall clock ends; every exec also
    heartbeats first. Only a 409 (the trial is no longer live) stops the loop.
@@ -370,9 +378,32 @@ Each of these fails the sample and releases its concurrency slot:
 | `EvalClaimDenied` with HTTP 402 (`is_funding` is true) | Funding denial, with the decision (`verdict`, `reason_code`, `error_message`, raw `decision`). |
 | `EvalClaimDenied` with HTTP 409 | A deploy denial, with the same decision fields. |
 | `RogueArenaApiError` with HTTP 409 | A state refusal: the job is not open, out of trials, already at `concurrency`, or Rogue Arena is not accepting new trials for your organization right now. |
-| `TrialReadyTimeout` | The trial was not `ready` within `max_wait_seconds`. The provider cancels it. |
-| `TrialClosedBeforeReady` | Rogue Arena closed the trial while it was provisioning. |
+| `TrialReadyTimeout` | The trial was still `provisioning` when the `max_wait_seconds` backstop ran out. The provider cancels it. |
+| `TrialClosedBeforeReady` | Rogue Arena closed the trial while it was provisioning: a build that stopped progressing, one that outran the wall clock, or a failed hand-over check. The message (and `reason`) carries Rogue Arena's account of why. |
 | `httpx.TransportError`, or `RogueArenaApiError` with HTTP 502/503/504 | The claim and its one resend both went unanswered. The provider cancels any trial that was opened, then raises. |
+
+### Large scenarios
+
+A trial may build a fresh copy of the eval's range, and a large scenario's
+build regularly takes more than 15 minutes. The provider judges the wait by
+Rogue Arena's state, not by age: it keeps waiting while Rogue Arena reports the
+trial `provisioning`. Rogue Arena watches the build's progress and ends a build
+that stops progressing (currently after 30 minutes without progress); the
+sample then fails with `TrialClosedBeforeReady` and Rogue Arena's reason.
+Rogue Arena also ends any build after 3 hours, and a build still running when
+the trial's wall clock ends. `max_wait_seconds` is only a backstop for a wait
+that never ends: by default 2 hours, or the wall clock plus 5 minutes if that is
+longer, so Rogue Arena's own answer always lands first. Set it (or
+`ROGUE_ARENA_MAX_WAIT_SECONDS`) to cap the wait yourself. When the trial
+reached its wall clock, the message says so and suggests a higher
+`--max-runtime`.
+
+**Raise `--max-runtime` for a large scenario.** Each trial's wall clock
+(`max_runtime_seconds`, default 3600) runs from the claim, so build time comes
+out of the agent's time, and a build still running when the wall clock ends
+ends the trial. With a 40-minute build and the default hour, the agent gets
+about 20 minutes. Add the expected build time to the time the agent needs, for
+example `rogue-arena-inspect launch --eval <id> --model … --max-runtime 7200`.
 
 ### Concurrency
 
@@ -384,6 +415,48 @@ The provider also implements Inspect's `default_concurrency()` hook, which sets
 Inspect's default `--max-sandboxes` to `ROGUE_ARENA_CONCURRENCY` (default 2).
 When a task config sets `concurrency`, pass the same value as `--max-sandboxes`
 so Inspect's queue matches the job's limit.
+
+### Parallel runs: `launch --parallel N`
+
+```bash
+rogue-arena-inspect launch --eval <id> --model … --parallel 4
+```
+
+`--parallel N` runs N trials at once from one command. It passes `--epochs N`,
+`--max-sandboxes N` and `--max-samples N` to `inspect eval`, and sets the job's
+concurrency (`ROGUE_ARENA_CONCURRENCY=N`), so Inspect and Rogue Arena agree on the
+limit. Each epoch of a sample is its own trial on its own copy of the range: the
+built-in task has one sample, so it runs N trials, and a task with S samples
+runs S × N. The job's `max_trials` defaults to 10000, enough for any run, and
+`launch` refuses a `ROGUE_ARENA_MAX_TRIALS` below N. `launch` also refuses
+`--epochs`, `--max-sandboxes` or `--max-samples` after `--`, and `--team` (a
+team's chatroom and activity feed belong to its run, so parallel team trials
+would share them; launch separate team runs instead). With more than one epoch,
+Inspect reduces each sample's epochs (by default to their mean) before it
+computes the metrics, so on the one-sample built-in task the mean is the mean
+over the N trials but `stderr` is 0 (Inspect needs two samples for it); each
+trial's own score stays in the log's samples.
+
+N is what you ask for. Two things cap how many trials actually run at once:
+
+- **The eval's concurrency limit.** Rogue Arena admits at most the job's
+  `concurrency` trials at once, and each trial's copy still needs your
+  organization's deploy admission and funding. A claim that is refused
+  (`EvalClaimDenied`, HTTP 402 or 409) errors its sample; it does not wait.
+  Under Inspect's default `fail_on_error`, that one error stops the whole run
+  and cancels the other trials: pick an N your organization can deploy at once,
+  or let the run go on past such errors with `-- --no-fail-on-error` (or a
+  threshold such as `-- --fail-on-error 0.25`).
+- **The warm pool.** Only warm copies start at once (`evals` shows how many,
+  e.g. `ready now (2 warm)`). Each trial beyond them builds a fresh copy
+  (`on demand, ~X min`), and a large scenario's build can take well over 15
+  minutes, so those trials start as their builds finish (see
+  [Large scenarios](#large-scenarios)).
+
+`--parallel` sets the environment, so a task whose sandbox config sets
+`concurrency` or `max_trials` explicitly keeps its own values (explicit config
+wins), and only Inspect's limits change. Remove them from the task's config, or
+set them to match.
 
 ## Commands
 
@@ -420,7 +493,9 @@ An upload is capped at 10 MiB.
 ## Scoring: `rogue_arena_hops()`
 
 The scorer closes the trial and reads the **server score** the close returns. It
-never computes a hop locally, never runs a command, and never submits a key.
+never computes a hop locally, never runs a command, and never submits a key. To
+also report the other scoring mode, see
+[Both scoring modes](#both-scoring-modes-reportboth).
 
 Key-file hops are proven server-side: Rogue Arena counts a key-file hop only
 when the planted key appears in the agent's exec output (including background
@@ -448,6 +523,35 @@ the whole run. To tolerate them, pass `--no-fail-on-error`, or a threshold such
 as `--fail-on-error 0.1`. From Python, pass `fail_on_error=False` to
 `inspect_ai.eval()`. To retry, `--retry-on-error N` claims a fresh trial for
 each retry, so leave headroom in `max_trials`.
+
+### Both scoring modes: `report="both"`
+
+An eval's author picks its scoring mode, and `rogue_arena_hops()` keeps that
+mode's count as the official value. To also see the other mode, report both:
+
+```bash
+rogue-arena-inspect launch --eval <id> --model … --report both   # sets ROGUE_ARENA_REPORT
+inspect eval eval_example.py -T report=both --model …             # the task arg
+```
+
+In your own task, use `scorer=rogue_arena_scorers(report)`: `official` (the
+default; `None` reads `ROGUE_ARENA_REPORT`) is `[rogue_arena_hops()]`, and
+`both` adds `rogue_arena_hops_by_mode()`.
+
+- **`sequential`** counts the hops before the first failed step.
+  **`independent`** counts every passed hop. They differ when a later hop passed
+  after an earlier one failed: hops `[fail, pass, pass]` count 0/3 sequential
+  and 2/3 independent.
+- The results show a `sequential` and an `independent` metric, each with `mean`
+  and `stderr` and each reduced over epochs. The eval's own mode is Rogue
+  Arena's count (it always matches `rogue_arena_hops`); the other is recounted
+  from Rogue Arena's per-hop check results.
+- If a hop that counts under the recounted mode reached no verdict (its check
+  did not run, `per_hop[].check_ran: false`), Rogue Arena would not score the
+  trial under that mode, so that metric leaves the trial out (its value is NaN
+  and its metadata counts are null).
+- **Metadata:** `trial_id`, `scoring_mode` (the eval's own), `hops_total`, and
+  `hops_passed_<mode>` and `reached_step_<mode>` for each mode.
 
 ## Python client
 
@@ -496,6 +600,26 @@ The license grants no rights to the "Rogue Arena" or "Rogue Labs" names or
 marks.
 
 ## Changelog
+
+### 0.5.0
+
+- **Fix: waiting for a range build.** A trial is now waited for as long as
+  Rogue Arena reports its range `provisioning`; Rogue Arena ends a build that
+  stops progressing itself. Before, a large scenario whose build took over 15
+  minutes failed with `TrialReadyTimeout` while it was still building.
+  `max_wait_seconds` (`ROGUE_ARENA_MAX_WAIT_SECONDS`) stays as the override; its
+  default is now a backstop of 2 hours, or the wall clock plus 5 minutes if
+  that is longer. `TrialClosedBeforeReady` now carries Rogue Arena's reason.
+  Build time counts against the trial's wall clock, so raise `--max-runtime`
+  for a large scenario; see [Large scenarios](#large-scenarios).
+- **Both scoring modes.** `report="both"` (`-T report=both`,
+  `ROGUE_ARENA_REPORT=both`, `launch --report both`, or
+  `rogue_arena_scorers("both")` in your own task) also reports the sequential
+  and independent hop counts as two metrics. `rogue_arena_hops()` and its
+  official value are unchanged. See
+  [Both scoring modes](#both-scoring-modes-reportboth).
+- **Parallel runs.** `launch --parallel N` runs N trials at once. See
+  [Parallel runs](#parallel-runs-launch---parallel-n).
 
 ### 0.4.0
 

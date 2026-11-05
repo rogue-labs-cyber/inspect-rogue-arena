@@ -38,7 +38,13 @@ from inspect_rogue_arena.client import (
 )
 from inspect_rogue_arena.config import RogueArenaSandboxConfig
 from inspect_rogue_arena.sandbox import RogueArenaSandboxEnvironment
-from inspect_rogue_arena.scorer import TrialNotScored, rogue_arena_hops
+from inspect_rogue_arena.scorer import (
+    HopReport,
+    TrialNotScored,
+    rogue_arena_hops,
+    rogue_arena_hops_by_mode,
+    rogue_arena_scorers,
+)
 from inspect_rogue_arena.team import (
     ActivityEntry,
     ActivityFeed,
@@ -94,6 +100,7 @@ __all__ = [
     "EvalWhoami",
     "ExecOutcomeUnknown",
     "Finding",
+    "HopReport",
     "RogueArenaApiError",
     "RogueArenaClient",
     "RogueArenaSandboxConfig",
@@ -116,6 +123,8 @@ __all__ = [
     "read_messages",
     "read_scoreboard",
     "rogue_arena_hops",
+    "rogue_arena_hops_by_mode",
+    "rogue_arena_scorers",
     "rogue_bash",
     "summarize_activity",
     "team_solver",

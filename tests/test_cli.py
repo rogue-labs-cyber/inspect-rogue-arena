@@ -17,8 +17,9 @@ from unittest.mock import patch
 
 import httpx
 
-from inspect_rogue_arena.cli import build_parser, main
+from inspect_rogue_arena.cli import _PARALLEL_FLAGS, build_parser, main
 from inspect_rogue_arena.client import RogueArenaClient
+from inspect_rogue_arena.config import RogueArenaSandboxConfig
 
 BASE_URL = "https://hub.example.test"
 TOKEN = "ra_eval_S3cretTokenValueNeverPrinted9f2c"
@@ -777,6 +778,116 @@ class CliLaunchTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("ROGUE_ARENA_MAX_RUNTIME_SECONDS", env)
 
+    def test_launch_report_both_sets_the_env_var_the_tasks_read(self) -> None:
+        code, cmd, env, _ = _launch(
+            ["launch", "--model", "m", "--eval", "x", "--report", "both"]
+        )
+        assert cmd is not None and env is not None
+        self.assertEqual(code, 0)
+        self.assertEqual(env["ROGUE_ARENA_REPORT"], "both")
+        self.assertNotIn("--report", cmd)
+
+    def test_launch_without_report_leaves_the_env_var_alone(self) -> None:
+        code, _, env, _ = _launch(["launch", "--model", "m", "--eval", "x"])
+        assert env is not None
+        self.assertEqual(code, 0)
+        self.assertNotIn("ROGUE_ARENA_REPORT", env)
+
+    def test_launch_rejects_an_unknown_report(self) -> None:
+        code, cmd, _, stderr = _launch(
+            ["launch", "--model", "m", "--eval", "x", "--report", "sequential"]
+        )
+        self.assertEqual(code, 2)
+        self.assertIsNone(cmd)
+        self.assertIn("invalid choice", stderr)
+
+    def test_launch_parallel_sets_epochs_sandboxes_samples_and_job_concurrency(
+        self,
+    ) -> None:
+        code, cmd, env, stderr = _launch(
+            ["launch", "--model", "m", "--eval", "x", "--parallel", "4"],
+            env={**ENV, "ROGUE_ARENA_CONCURRENCY": "2"},
+        )
+        assert cmd is not None and env is not None
+        self.assertEqual(code, 0)
+        for flag in ("--epochs", "--max-sandboxes", "--max-samples"):
+            with self.subTest(flag):
+                self.assertEqual(cmd[cmd.index(flag) + 1], "4")
+        # the flag wins over an inherited concurrency, so all three agree
+        self.assertEqual(env["ROGUE_ARENA_CONCURRENCY"], "4")
+        self.assertNotIn("--parallel", cmd)
+        self.assertIn("admits 4 trials at once", stderr)
+        # the child's sandbox config resolves the same limit, and its default
+        # max_trials admits them
+        config = RogueArenaSandboxConfig.from_sources(None, environ=env)
+        self.assertEqual(config.concurrency, 4)
+        self.assertGreaterEqual(config.max_trials, 4)
+
+    def test_launch_parallel_keeps_extra_args_after_its_own(self) -> None:
+        code, cmd, _, _ = _launch(
+            ["launch", "--model", "m", "--eval", "x", "--parallel", "2", "--"]
+            + ["--limit", "1"]
+        )
+        assert cmd is not None
+        self.assertEqual(code, 0)
+        self.assertEqual(cmd[-2:], ["--limit", "1"])
+
+    def test_launch_parallel_refuses_flags_it_sets_itself(self) -> None:
+        for extra in (["--epochs", "2"], ["--max-sandboxes=8"], ["--max-samples", "3"]):
+            with self.subTest(extra=extra):
+                code, cmd, _, stderr = _launch(
+                    ["launch", "--model", "m", "--eval", "x", "--parallel", "4", "--"]
+                    + extra
+                )
+                self.assertEqual(code, 1)
+                self.assertIsNone(cmd)
+                self.assertIn("--parallel sets", stderr)
+                self.assertIn(extra[0].split("=")[0], stderr)
+
+    def test_launch_parallel_refuses_a_max_trials_cap_below_n(self) -> None:
+        code, cmd, _, stderr = _launch(
+            ["launch", "--model", "m", "--eval", "x", "--parallel", "3"],
+            env={**ENV, "ROGUE_ARENA_MAX_TRIALS": "2"},
+        )
+        self.assertEqual(code, 1)
+        self.assertIsNone(cmd)
+        self.assertIn("ROGUE_ARENA_MAX_TRIALS=2", stderr)
+        # a cap that covers N is the user's choice and stays as set
+        code, _, env, _ = _launch(
+            ["launch", "--model", "m", "--eval", "x", "--parallel", "3"],
+            env={**ENV, "ROGUE_ARENA_MAX_TRIALS": "6"},
+        )
+        assert env is not None
+        self.assertEqual(code, 0)
+        self.assertEqual(env["ROGUE_ARENA_MAX_TRIALS"], "6")
+
+    def test_launch_parallel_needs_a_whole_number_of_at_least_one(self) -> None:
+        for value in ("0", "-2", "two"):
+            with self.subTest(value=value):
+                code, cmd, _, stderr = _launch(
+                    ["launch", "--model", "m", "--eval", "x", "--parallel", value]
+                )
+                self.assertEqual(code, 2)
+                self.assertIsNone(cmd)
+                self.assertIn("--parallel", stderr)
+
+    def test_launch_parallel_refuses_a_team_run(self) -> None:
+        team_yaml = EXAMPLES_DIR / "team.yaml"
+        code, cmd, _, stderr = _launch(
+            ["launch", "--team", str(team_yaml), "--eval", "x", "--parallel", "2"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIsNone(cmd)
+        self.assertIn("does not run team tasks", stderr)
+
+    def test_launch_without_parallel_sets_none_of_its_flags(self) -> None:
+        code, cmd, env, _ = _launch(["launch", "--model", "m", "--eval", "x"])
+        assert cmd is not None and env is not None
+        self.assertEqual(code, 0)
+        for flag in ("--epochs", "--max-sandboxes", "--max-samples"):
+            self.assertNotIn(flag, cmd)
+        self.assertNotIn("ROGUE_ARENA_CONCURRENCY", env)
+
     def test_launch_passes_extra_args_through_to_inspect(self) -> None:
         code, cmd, _, _ = _launch(
             ["launch", "--model", "m", "--eval", "x", "--", "--limit", "1"]
@@ -942,6 +1053,85 @@ class CliFailureTests(unittest.TestCase):
         self.assertEqual(run.stdout, "")
         self.assertIn("invalid whoami", run.stderr)
         self.assertNotIn(TOKEN, run.output)
+
+
+class LaunchParallelInspectRunTests(unittest.TestCase):
+    """``launch --parallel N``'s settings, applied to a real offline Inspect run."""
+
+    def test_n_trials_run_at_once_each_on_its_own_copy(self) -> None:
+        import anyio
+        from inspect_ai import Task
+        from inspect_ai import eval as inspect_eval
+        from inspect_ai.dataset import Sample
+        from inspect_ai.solver import Generate, Solver, TaskState, solver
+        from inspect_ai.util import sandbox
+        from test_sandbox import EVAL_NAME, FakeHub
+
+        from inspect_rogue_arena.sandbox import RogueArenaSandboxEnvironment
+        from inspect_rogue_arena.scorer import rogue_arena_hops
+
+        parallel = 3
+        code, cmd, env, _ = _launch(
+            ["launch", "--model", "mockllm/model", "--eval", EVAL_NAME]
+            + ["--parallel", str(parallel)]
+        )
+        assert cmd is not None and env is not None
+        self.assertEqual(code, 0)
+        flags = {flag: int(cmd[cmd.index(flag) + 1]) for flag in _PARALLEL_FLAGS}
+
+        # Each trial holds its copy until all N are ready at once; a limit
+        # below N anywhere (Inspect's or the job's) would time this out.
+        arrived = 0
+        all_ready = anyio.Event()
+
+        @solver
+        def hold_the_copy() -> Solver:
+            async def solve(state: TaskState, generate: Generate) -> TaskState:
+                nonlocal arrived
+                await sandbox().exec(["id"])
+                arrived += 1
+                if arrived == parallel:
+                    all_ready.set()
+                with anyio.fail_after(10):
+                    await all_ready.wait()
+                return state
+
+            return solve
+
+        hub = FakeHub(self)
+        task = Task(
+            dataset=[Sample(input="q", id="s-1")],
+            solver=hold_the_copy(),
+            scorer=rogue_arena_hops(),
+            sandbox="rogue-arena",  # configured from the launch's child env
+            name="parallel_task",
+        )
+        RogueArenaSandboxEnvironment._runtimes.clear()
+        with (
+            tempfile.TemporaryDirectory() as log_dir,
+            patch.dict(os.environ, env, clear=True),
+            patch.object(RogueArenaClient, "from_env", return_value=hub.client()),
+        ):
+            log = inspect_eval(
+                task,
+                model="mockllm/model",
+                epochs=flags["--epochs"],
+                max_sandboxes=flags["--max-sandboxes"],
+                max_samples=flags["--max-samples"],
+                log_dir=log_dir,
+                display="none",
+            )[0]
+            self.assertEqual(log.status, "success", log.error)
+            samples = log.samples or []
+
+        self.assertEqual(len(samples), parallel)
+        self.assertTrue(all(sample.scores for sample in samples))
+        (job,) = hub.calls("POST", "/hub/eval/jobs")
+        self.assertEqual(job["concurrency"], parallel)
+        self.assertGreaterEqual(job["n"], parallel)
+        self.assertEqual(len(hub.calls("POST", "/hub/eval/trials")), parallel)
+        # all N were open at once, not queued behind a smaller limit
+        self.assertEqual(hub.peak_open_trials, parallel)
 
 
 if __name__ == "__main__":

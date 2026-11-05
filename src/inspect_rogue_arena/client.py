@@ -10,6 +10,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
@@ -23,6 +24,11 @@ _LOGGER = logging.getLogger(__name__)
 # it always reaches Rogue Arena (it is never resent), bounded by the
 # close request's own timeout so it cannot hold a cancellation open forever.
 _CLOSE_REQUEST_SECONDS = 60
+# The claim POST's own timeout, so a long ready wait never lets one hung request
+# block for its whole length (900 s was the claim's bound before the wait grew).
+_CLAIM_REQUEST_SECONDS = 900.0
+# Each ready poll's own timeout: a hung poll is retried, never waited out.
+_READY_POLL_REQUEST_SECONDS = 60.0
 
 
 class EvalJobStatus(str, Enum):
@@ -180,23 +186,82 @@ class EvalClaimDenied(RogueArenaApiError):
 
 
 class TrialReadyTimeout(TimeoutError):
+    """The trial was still provisioning when the client's backstop ran out.
+
+    The hub judges provisioning progress itself and expires a copy that stops
+    progressing (``TrialClosedBeforeReady``), so the client waits while the
+    hub reports the trial provisioning, up to ``max_wait_seconds``.
+    """
+
     def __init__(self, trial_id: str, max_wait_seconds: float) -> None:
         self.trial_id = trial_id
         self.max_wait_seconds = max_wait_seconds
         super().__init__(
-            f"Rogue Arena trial {trial_id} was not ready within {max_wait_seconds:g} seconds"
+            f"Rogue Arena trial {trial_id} was still provisioning after "
+            f"{max_wait_seconds:g} seconds (the client's max_wait_seconds backstop)"
         )
 
 
 class TrialClosedBeforeReady(RuntimeError):
-    def __init__(self, trial: EvalTrial) -> None:
+    """The hub closed the trial while it was provisioning.
+
+    ``reason`` is the hub's own account of why (its last lifecycle event for
+    the trial, e.g. ``expired while provisioning: the copy did not come up
+    within the wall clock``), or ``None`` when it could not be read.
+    """
+
+    def __init__(self, trial: EvalTrial, reason: str | None = None) -> None:
         self.trial = trial
+        self.reason = reason
         outcome = trial.outcome.value if trial.outcome else None
-        reason = trial.terminal_reason.value if trial.terminal_reason else None
-        super().__init__(
+        terminal = trial.terminal_reason.value if trial.terminal_reason else None
+        infra = f", infraReason={trial.infra_reason}" if trial.infra_reason else ""
+        message = (
             f"Rogue Arena trial {trial.id} became {trial.status.value} before it "
-            f"was ready (outcome={outcome}, terminalReason={reason})"
+            f"was ready (outcome={outcome}, terminalReason={terminal}{infra})"
         )
+        if reason:
+            message += f": {reason}"
+        if _wall_clock_ran_out(trial):
+            message += (
+                "; the trial's wall clock (max_runtime_seconds) ran out before its "
+                "range was ready, and provisioning counts against it, so a large "
+                "scenario needs a higher one"
+            )
+        super().__init__(message)
+
+
+def _hub_time(value: str | None) -> datetime | None:
+    """A hub ISO timestamp (``...Z``), or None when absent or unparseable."""
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _not_before(value: str | None, start: datetime) -> bool:
+    at = _hub_time(value)
+    try:
+        return at is not None and at >= start
+    except TypeError:  # one naive, one aware: not comparable, so not known
+        return False
+
+
+def _wall_clock_ran_out(trial: EvalTrial) -> bool:
+    """Whether the hub closed the trial at or past its lease (its wall clock).
+
+    A provisioning trial's lease is its claim plus the wall clock; the hub
+    expires a copy that stops progressing earlier than that, and then a
+    longer wall clock would not have helped.
+    """
+    lease = _hub_time(trial.lease_expires_at)
+    return (
+        trial.outcome is EvalTrialOutcome.EXPIRED
+        and lease is not None
+        and _not_before(trial.closed_at, lease)
+    )
 
 
 def _str(value: Any, field: str) -> str:
@@ -442,6 +507,9 @@ class EvalTrial:
     client_attempt_key: str | None
     score: EvalScore | None
     hop_results: tuple[EvalHopResult, ...] | None
+    # The hub's coded infrastructure reason (e.g. provisioning_failed), kept as
+    # the wire string: the client only reports it, and a newer hub may add codes.
+    infra_reason: str | None
     raw: Mapping[str, Any]
 
     @classmethod
@@ -495,6 +563,7 @@ class EvalTrial:
                 if hops is not None
                 else None
             ),
+            infra_reason=_opt_str(value.get("infraReason"), "infraReason"),
             raw=MappingProxyType(dict(value)),
         )
 
@@ -987,7 +1056,9 @@ class RogueArenaClient:
         )
         started = self._monotonic()
         try:
-            claimed = await self._post_claim(body, max_wait_seconds)
+            claimed = await self._post_claim(
+                body, min(max_wait_seconds, _CLAIM_REQUEST_SECONDS)
+            )
         except (httpx.TransportError, RogueArenaApiError) as error:
             if not _is_transient(error):
                 raise
@@ -997,7 +1068,9 @@ class RogueArenaClient:
             # this key (created: false), never a second one.
             remaining = max(1.0, max_wait_seconds - (self._monotonic() - started))
             try:
-                claimed = await self._post_claim(body, remaining)
+                claimed = await self._post_claim(
+                    body, min(remaining, _CLAIM_REQUEST_SECONDS)
+                )
             except BaseException as retry_error:
                 await self._cancel_unanswered_claim(job_id, client_attempt_key)
                 if isinstance(retry_error, Exception) and _is_transient(retry_error):
@@ -1104,7 +1177,10 @@ class RogueArenaClient:
             await self._sleep(min(poll_interval_seconds, max_wait_seconds - elapsed))
             remaining = max(1.0, max_wait_seconds - (self._monotonic() - started))
             try:
-                trial = await self.get_trial(trial.id, timeout_seconds=remaining)
+                trial = await self.get_trial(
+                    trial.id,
+                    timeout_seconds=min(remaining, _READY_POLL_REQUEST_SECONDS),
+                )
             except (httpx.TransportError, RogueArenaApiError) as error:
                 # server-owned trial: a transient 5xx / transport blip retries;
                 # a definite state error (409) or foreign id (404) is fatal.
@@ -1115,8 +1191,40 @@ class RogueArenaClient:
                     raise
                 continue
         if trial.status in (EvalTrialStatus.CLOSED, EvalTrialStatus.CLOSING):
-            raise TrialClosedBeforeReady(trial)
+            raise TrialClosedBeforeReady(trial, await self._closed_reason(trial))
         return trial
+
+    async def _closed_reason(self, trial: EvalTrial) -> str | None:
+        """Why the hub closed a trial, from its lifecycle events; best effort.
+
+        The hub records why it ended a provisioning trial (the copy stopped
+        progressing, the wall clock ran out, an isolation audit failed) as a
+        lifecycle event in the close, then a closing summary (``closed:
+        <outcome> (<reasons>), ...``) that repeats the trial's coded fields.
+        So the reason is the close's lifecycle events (those at or after
+        ``closedAt``) without the last one. None when the hub gave none.
+        """
+        closed_at = _hub_time(trial.closed_at)
+        if closed_at is None:
+            return None
+        try:
+            events = await self.list_trial_events(
+                trial.id, timeout_seconds=_CLOSE_REQUEST_SECONDS
+            )
+        except Exception as error:  # noqa: BLE001 - the reason is a nicety
+            _LOGGER.warning(
+                "could not read Rogue Arena trial %s events for its close reason: %s",
+                trial.id,
+                type(error).__name__,
+            )
+            return None
+        at_close = [
+            event.summary
+            for event in events
+            if event.kind is EvalTrialEventKind.LIFECYCLE
+            and _not_before(event.at, closed_at)
+        ]
+        return "; ".join(at_close[:-1]) or None
 
     async def get_trial(
         self, trial_id: str, *, timeout_seconds: float | None = None
@@ -1212,8 +1320,14 @@ class RogueArenaClient:
             if trial.status is EvalTrialStatus.CLOSED:
                 return trial
 
-    async def list_trial_events(self, trial_id: str) -> tuple[EvalTrialEvent, ...]:
-        body = await self._request("GET", f"/hub/eval/trials/{trial_id}/events")
+    async def list_trial_events(
+        self, trial_id: str, *, timeout_seconds: float | None = None
+    ) -> tuple[EvalTrialEvent, ...]:
+        body = await self._request(
+            "GET",
+            f"/hub/eval/trials/{trial_id}/events",
+            timeout_seconds=timeout_seconds,
+        )
         if not isinstance(body, list):
             raise TypeError("Rogue Arena returned an invalid trial event list")
         return tuple(

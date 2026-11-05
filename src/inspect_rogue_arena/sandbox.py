@@ -229,15 +229,18 @@ def _log_claim_failure(sample_id: str, error: BaseException) -> None:
     elif isinstance(error, TrialClosedBeforeReady):
         logger.error(
             "Rogue Arena trial %s for sample %s closed before it was ready "
-            "(outcome=%s terminal_reason=%s)",
+            "(outcome=%s terminal_reason=%s infra_reason=%s): %s",
             error.trial.id,
             sample_id,
             error.trial.outcome.value if error.trial.outcome else None,
             error.trial.terminal_reason.value if error.trial.terminal_reason else None,
+            error.trial.infra_reason,
+            error.reason or "the hub gave no reason",
         )
     elif isinstance(error, TrialReadyTimeout):
         logger.error(
-            "Rogue Arena trial %s for sample %s was not ready within %ss",
+            "Rogue Arena trial %s for sample %s was still provisioning after %ss "
+            "(the max_wait_seconds backstop)",
             error.trial_id,
             sample_id,
             error.max_wait_seconds,
@@ -494,7 +497,7 @@ class RogueArenaSandboxEnvironment(SandboxEnvironment):
                 inspect_eval_set_id=_reserved_str(metadata, "__eval_set_id__"),
                 inspect_task_id=task_name,
                 sandbox_name=entry.name or entry.environment_id,
-                max_wait_seconds=resolved.max_wait_seconds,
+                max_wait_seconds=resolved.ready_wait_seconds,
                 poll_interval_seconds=resolved.poll_interval_seconds,
             )
         except BaseException as error:

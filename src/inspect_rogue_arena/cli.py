@@ -16,7 +16,9 @@ Commands:
   path relative to the working directory (``inspect eval`` globs it from there,
   and Python 3.14's pathlib rejects absolute glob patterns) and, with
   ``--team FILE``, runs a multi-agent team task. ``--max-runtime SECONDS`` sets
-  the per-trial wall clock (``ROGUE_ARENA_MAX_RUNTIME_SECONDS``).
+  the per-trial wall clock (``ROGUE_ARENA_MAX_RUNTIME_SECONDS``); ``--report
+  both`` also reports the sequential and independent hop counts
+  (``ROGUE_ARENA_REPORT``); ``--parallel N`` runs N trials at once.
 
 The API commands use a personal ``ra_eval_`` token from ``ROGUE_ARENA_TOKEN``
 (or ``--token``) against ``ROGUE_ARENA_BASE_URL`` (or ``--base-url``). The
@@ -52,6 +54,8 @@ from inspect_rogue_arena.client import (
     RogueArenaApiError,
     RogueArenaClient,
 )
+from inspect_rogue_arena.config import RogueArenaSandboxConfig
+from inspect_rogue_arena.scorer import REPORT_ENV, HopReport
 
 _PROG = "rogue-arena-inspect"
 _REDACTED = "[redacted]"
@@ -468,6 +472,52 @@ def _task_argument(task: Path) -> str:
         ) from error
 
 
+# The `inspect eval` flags `launch --parallel` sets itself.
+_PARALLEL_FLAGS = ("--epochs", "--max-sandboxes", "--max-samples")
+
+
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {value!r}") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, not {number}")
+    return number
+
+
+def _parallel_args(
+    parallel: int, passthrough: Sequence[str], env: dict[str, str]
+) -> list[str]:
+    """``inspect eval`` args that run ``parallel`` trials at once.
+
+    Each epoch of a sample is its own trial on its own copy of the range, so
+    ``--epochs N`` makes N trials of every sample; ``--max-sandboxes`` and
+    ``--max-samples`` let Inspect run all N at once, and the job's concurrency
+    (``ROGUE_ARENA_CONCURRENCY``, set in ``env``) lets the hub admit them. The
+    job's ``max_trials`` must cover them: its default admits 10000.
+    """
+    clashes = sorted(
+        {arg.split("=", 1)[0] for arg in passthrough} & set(_PARALLEL_FLAGS)
+    )
+    if clashes:
+        raise RuntimeError(
+            f"--parallel sets {', '.join(_PARALLEL_FLAGS)} itself; drop "
+            f"{', '.join(clashes)} from the args after --"
+        )
+    cap = env.get("ROGUE_ARENA_MAX_TRIALS", "").strip()
+    if cap.isdigit() and int(cap) < parallel:
+        raise RuntimeError(
+            f"--parallel {parallel} runs at least {parallel} trials, but "
+            f"ROGUE_ARENA_MAX_TRIALS={cap} lets the job admit only {cap}; raise "
+            "it or unset it (the default admits "
+            f"{RogueArenaSandboxConfig().max_trials})"
+        )
+    env["ROGUE_ARENA_CONCURRENCY"] = str(parallel)
+    count = str(parallel)
+    return [flag_arg for flag in _PARALLEL_FLAGS for flag_arg in (flag, count)]
+
+
 def _launch(args: argparse.Namespace) -> int:
     with contextlib.ExitStack() as stack:
         return _launch_within(args, stack)
@@ -484,6 +534,15 @@ def _launch_within(args: argparse.Namespace, stack: contextlib.ExitStack) -> int
     if args.max_runtime is not None:
         # The sandbox config owns the 60..86400 bound; it validates this value.
         env["ROGUE_ARENA_MAX_RUNTIME_SECONDS"] = str(args.max_runtime)
+    if args.report is not None:
+        # The built-in tasks read it through rogue_arena_scorers().
+        env[REPORT_ENV] = args.report
+    if args.parallel is not None and args.team:
+        raise RuntimeError(
+            "--parallel does not run team tasks: a team's chatroom and activity "
+            "feed belong to its run, so parallel team trials in one run would "
+            "share them; launch separate team runs instead"
+        )
     model = args.model
     if args.team:
         team_path = Path(args.team).expanduser().resolve()
@@ -512,6 +571,13 @@ def _launch_within(args: argparse.Namespace, stack: contextlib.ExitStack) -> int
         "--model",
         model,
     ]
+    if args.parallel is not None:
+        cmd += _parallel_args(args.parallel, passthrough, env)
+        print(
+            f"{_PROG}: --parallel {args.parallel}: the job admits "
+            f"{args.parallel} trials at once (ROGUE_ARENA_CONCURRENCY)",
+            file=sys.stderr,
+        )
     cmd += passthrough
     # The token is in env, not in cmd; this line is safe to show.
     print(f"{_PROG}: {shlex.join(cmd)}", file=sys.stderr)
@@ -623,6 +689,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "per-trial wall clock in seconds (sets ROGUE_ARENA_MAX_RUNTIME_SECONDS; "
             "60 to 86400)"
+        ),
+    )
+    launch.add_argument(
+        "--parallel",
+        type=_positive_int,
+        metavar="N",
+        help=(
+            "run N trials at once: sets inspect's --epochs, --max-sandboxes and "
+            "--max-samples to N, and the job's concurrency "
+            "(ROGUE_ARENA_CONCURRENCY) to N"
+        ),
+    )
+    launch.add_argument(
+        "--report",
+        choices=[report.value for report in HopReport],
+        help=(
+            "official: the eval's own scoring mode (default); both: also report "
+            "the sequential and independent hop counts (sets ROGUE_ARENA_REPORT)"
         ),
     )
     launch.add_argument(

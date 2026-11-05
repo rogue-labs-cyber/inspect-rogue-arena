@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import unittest
+from typing import Any
 from unittest.mock import patch
 
 import httpx
@@ -21,11 +22,13 @@ from inspect_rogue_arena.client import (
     EvalTrialStatus,
     EvalTrialTerminalReason,
     ExecOutcomeUnknown,
+    HttpResult,
     RogueArenaApiError,
     RogueArenaClient,
     TrialClosedBeforeReady,
     TrialReadyTimeout,
 )
+from inspect_rogue_arena.config import RogueArenaSandboxConfig
 
 
 def _client(handler) -> RogueArenaClient:
@@ -861,6 +864,9 @@ class RogueArenaTrialLifecycleTests(unittest.IsolatedAsyncioTestCase):
             caught.exception.trial.terminal_reason,
             EvalTrialTerminalReason.INFRA_ERROR,
         )
+        # this hub answers the event read with a trial, not an event list: the
+        # close reason stays unknown rather than guessed
+        self.assertIsNone(caught.exception.reason)
 
     async def test_poll_404_is_fatal(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -1173,6 +1179,264 @@ def _exec_client(handler) -> RogueArenaClient:
         transport=httpx.MockTransport(handler),
         sleep=_no_sleep,
     )
+
+
+class _ProvisioningHub:
+    """A hub whose claimed trial stays provisioning until a set (fake) time.
+
+    ``ends_at`` is when the hub ends the provisioning wait: the trial turns
+    ``ends_as`` (a trial body), or stays provisioning forever when ``ends_at``
+    is None. Time only moves when the client sleeps.
+    """
+
+    def __init__(
+        self,
+        *,
+        ends_at: float | None,
+        ends_as: dict[str, object] | None = None,
+        events: list[dict[str, object]] | None = None,
+    ) -> None:
+        self.clock = 0.0
+        self.ends_at = ends_at
+        self.ends_as = ends_as
+        self.events = events or []
+        self.polls = 0
+        self.closes: list[object] = []
+
+    def monotonic(self) -> float:
+        return self.clock
+
+    async def sleep(self, seconds: float) -> None:
+        self.clock += seconds
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/hub/eval/trials":
+            return httpx.Response(200, json=_trial_json("provisioning"))
+        if path.endswith("/close"):
+            self.closes.append(json.loads(request.content))
+            return httpx.Response(200, json=_trial_json("closed", outcome="cancelled"))
+        if path.endswith("/events"):
+            return httpx.Response(200, json=self.events)
+        self.polls += 1
+        if self.ends_at is not None and self.clock >= self.ends_at:
+            assert self.ends_as is not None
+            return httpx.Response(200, json=self.ends_as)
+        return httpx.Response(200, json=_trial_json("provisioning"))
+
+    def client(self) -> RogueArenaClient:
+        return RogueArenaClient(
+            "https://hub.example.test",
+            "ra_eval_TOKEN",
+            transport=httpx.MockTransport(self.handler),
+            sleep=self.sleep,
+            monotonic=self.monotonic,
+        )
+
+
+def _lifecycle(event_id: str, at: str, summary: str) -> dict[str, object]:
+    return {
+        "id": event_id,
+        "at": at,
+        "kind": "lifecycle",
+        "summary": summary,
+        "detail": None,
+    }
+
+
+CLAIMED_AT = "2026-11-04T00:00:00.000Z"
+# A provisioning trial's lease is its claim plus the wall clock (one hour here).
+LEASE_AT = "2026-11-04T01:00:00.000Z"
+STALL_REASON = (
+    "expired while provisioning: the copy did not come up within the wall clock"
+)
+
+
+def _expired(closed_at: str) -> dict[str, object]:
+    return _trial_json(
+        "closed",
+        outcome="expired",
+        terminalReason="infra_error",
+        infraReason="provisioning_failed",
+        claimedAt=CLAIMED_AT,
+        leaseExpiresAt=LEASE_AT,
+        closedAt=closed_at,
+    )
+
+
+def _close_events(closed_at: str, *reasons: str) -> list[dict[str, object]]:
+    """The hub's lifecycle rows: the claim, then the close's reason rows and
+    its closing summary (always written last, in the close's transaction)."""
+    return [
+        _lifecycle("e0", CLAIMED_AT, "claimed: cold copy dep-1 requested"),
+        *(
+            _lifecycle(f"e{index}", closed_at, reason)
+            for index, reason in enumerate(reasons, start=1)
+        ),
+        _lifecycle(
+            "e9",
+            closed_at,
+            "closed: expired (infra_error: provisioning_failed), 0/2 hops",
+        ),
+    ]
+
+
+class RogueArenaReadyWaitTests(unittest.IsolatedAsyncioTestCase):
+    """The ready wait follows the hub's provisioning state, not a fixed age."""
+
+    # the sandbox's default wait, so these pin the shipped behaviour
+    DEFAULT_WAIT = RogueArenaSandboxConfig().ready_wait_seconds
+
+    def _kwargs(self) -> dict[str, object]:
+        return {
+            **_claim_kwargs(),
+            "max_wait_seconds": self.DEFAULT_WAIT,
+            "poll_interval_seconds": 30,
+        }
+
+    def test_the_default_wait_is_a_two_hour_backstop(self) -> None:
+        self.assertEqual(self.DEFAULT_WAIT, 2 * 60 * 60)
+
+    def test_the_default_backstop_never_ends_before_a_longer_wall_clock(
+        self,
+    ) -> None:
+        # The hub expires a build past the wall clock itself; the client's
+        # default waits 5 minutes beyond it, so the hub's answer lands first.
+        longer = RogueArenaSandboxConfig(max_runtime_seconds=3 * 60 * 60)
+        self.assertEqual(longer.ready_wait_seconds, 3 * 60 * 60 + 5 * 60)
+        at_two_hours = RogueArenaSandboxConfig(max_runtime_seconds=2 * 60 * 60)
+        self.assertEqual(at_two_hours.ready_wait_seconds, 2 * 60 * 60 + 5 * 60)
+
+    def test_an_explicit_max_wait_is_the_backstop_whatever_the_wall_clock(
+        self,
+    ) -> None:
+        config = RogueArenaSandboxConfig.from_sources(
+            None,
+            environ={
+                "ROGUE_ARENA_MAX_WAIT_SECONDS": "900",
+                "ROGUE_ARENA_MAX_RUNTIME_SECONDS": "10800",
+            },
+        )
+        self.assertEqual(config.ready_wait_seconds, 900)
+
+    async def test_a_slow_build_the_hub_still_reports_provisioning_is_waited_for(
+        self,
+    ) -> None:
+        # A large scenario's cold build takes 40 minutes, well past the old
+        # fixed 15-minute wait; the hub reports it provisioning all along.
+        hub = _ProvisioningHub(ends_at=40 * 60, ends_as=_trial_json("ready"))
+
+        trial = await hub.client().claim_trial("job-1", **self._kwargs())
+
+        self.assertIs(trial.status, EvalTrialStatus.READY)
+        self.assertGreaterEqual(hub.clock, 40 * 60)
+        self.assertEqual(hub.closes, [])
+
+    async def test_a_stalled_build_ends_when_the_hub_expires_it_with_its_reason(
+        self,
+    ) -> None:
+        # The hub judges progress: after its no-progress window (before the
+        # wall clock) it expires the trial as an infrastructure failure and
+        # records why, then its closing summary.
+        closed_at = "2026-11-04T00:45:00.000Z"
+        hub = _ProvisioningHub(
+            ends_at=45 * 60,
+            ends_as=_expired(closed_at),
+            events=_close_events(closed_at, STALL_REASON),
+        )
+
+        with self.assertRaises(TrialClosedBeforeReady) as caught:
+            await hub.client().claim_trial("job-1", **self._kwargs())
+
+        error = caught.exception
+        # the reason row, not the closing summary or the claim row
+        self.assertEqual(error.reason, STALL_REASON)
+        self.assertEqual(error.trial.infra_reason, "provisioning_failed")
+        message = str(error)
+        self.assertIn("infraReason=provisioning_failed", message)
+        self.assertIn(STALL_REASON, message)
+        # it ended before the lease: a higher wall clock would not have helped
+        self.assertNotIn("max_runtime_seconds", message)
+        # the hub already closed it: the client never sends a cancel
+        self.assertEqual(hub.closes, [])
+        self.assertLess(hub.clock, self.DEFAULT_WAIT)
+
+    async def test_a_build_that_outran_the_wall_clock_says_to_raise_it(
+        self,
+    ) -> None:
+        closed_at = "2026-11-04T01:00:30.000Z"  # past the one-hour lease
+        hub = _ProvisioningHub(
+            ends_at=61 * 60,
+            ends_as=_expired(closed_at),
+            events=_close_events(closed_at, STALL_REASON),
+        )
+
+        with self.assertRaises(TrialClosedBeforeReady) as caught:
+            await hub.client().claim_trial("job-1", **self._kwargs())
+
+        self.assertIn("wall clock (max_runtime_seconds) ran out", str(caught.exception))
+
+    async def test_a_close_the_hub_gave_no_reason_for_has_none(self) -> None:
+        # Only the claim row and the closing summary: no reason to report, and
+        # neither of those is passed off as one.
+        closed_at = "2026-11-04T00:20:00.000Z"
+        hub = _ProvisioningHub(
+            ends_at=20 * 60,
+            ends_as=_expired(closed_at),
+            events=_close_events(closed_at),
+        )
+
+        with self.assertRaises(TrialClosedBeforeReady) as caught:
+            await hub.client().claim_trial("job-1", **self._kwargs())
+
+        self.assertIsNone(caught.exception.reason)
+
+    async def test_the_backstop_cancels_a_build_the_hub_never_ends(self) -> None:
+        hub = _ProvisioningHub(ends_at=None)
+
+        with self.assertRaises(TrialReadyTimeout) as caught:
+            await hub.client().claim_trial("job-1", **self._kwargs())
+
+        self.assertEqual(caught.exception.max_wait_seconds, self.DEFAULT_WAIT)
+        self.assertIn("still provisioning", str(caught.exception))
+        self.assertEqual(hub.clock, self.DEFAULT_WAIT)
+        self.assertEqual(hub.closes, [{"outcome": "cancelled"}])
+
+    async def test_an_explicit_max_wait_still_overrides_the_backstop(self) -> None:
+        explicit = RogueArenaSandboxConfig.from_sources(
+            None, environ={"ROGUE_ARENA_MAX_WAIT_SECONDS": "900"}
+        ).ready_wait_seconds
+        hub = _ProvisioningHub(ends_at=40 * 60, ends_as=_trial_json("ready"))
+
+        with self.assertRaises(TrialReadyTimeout):
+            await hub.client().claim_trial(
+                "job-1", **{**self._kwargs(), "max_wait_seconds": explicit}
+            )
+
+        self.assertEqual(hub.clock, 900)
+        self.assertEqual(hub.closes, [{"outcome": "cancelled"}])
+
+    async def test_each_request_of_a_long_wait_has_its_own_short_timeout(
+        self,
+    ) -> None:
+        # A two-hour wait never lets one hung request block for an hour.
+        timeouts: list[float | None] = []
+        original = RogueArenaClient.request_result
+
+        async def recording(
+            self_: RogueArenaClient, method: str, path: str, **kwargs: Any
+        ) -> HttpResult:
+            timeouts.append(kwargs.get("timeout_seconds"))
+            return await original(self_, method, path, **kwargs)
+
+        hub = _ProvisioningHub(ends_at=5 * 60, ends_as=_trial_json("ready"))
+        with patch.object(RogueArenaClient, "request_result", recording):
+            await hub.client().claim_trial("job-1", **self._kwargs())
+
+        claim, *polls = timeouts
+        self.assertEqual(claim, 900)
+        self.assertTrue(polls)
+        self.assertTrue(all(timeout == 60 for timeout in polls))
 
 
 class RogueArenaTerminalReasonTests(unittest.TestCase):

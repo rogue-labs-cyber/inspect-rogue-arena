@@ -11,7 +11,9 @@ then:
 
     rogue-arena-inspect launch --team team.yaml --eval <id>
 
-``rogue_arena_hops()`` reports the hops Rogue Arena scored when the trial closed.
+``rogue_arena_hops()`` reports the hops Rogue Arena scored when the trial closed;
+``-T report=both`` (or ``ROGUE_ARENA_REPORT=both``) also reports the sequential
+and independent counts as two metrics.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import os
 from inspect_ai import Task, task
 from inspect_ai.dataset import Sample
 
-from inspect_rogue_arena.scorer import rogue_arena_hops
+from inspect_rogue_arena.scorer import rogue_arena_scorers
 from inspect_rogue_arena.team import load_team_config, team_solver
 
 # The shared objective, same win condition as the single-agent example: each
@@ -42,7 +44,7 @@ TEAM_OBJECTIVE = (
 
 
 @task
-def rogue_arena_team() -> Task:
+def rogue_arena_team(report: str | None = None) -> Task:
     team_path = os.environ.get("ROGUE_ARENA_TEAM")
     if not team_path:
         raise RuntimeError(
@@ -53,6 +55,6 @@ def rogue_arena_team() -> Task:
     return Task(
         dataset=[Sample(input=TEAM_OBJECTIVE, target="scored by Rogue Arena on close")],
         solver=team_solver(config),
-        scorer=rogue_arena_hops(),
+        scorer=rogue_arena_scorers(report),
         sandbox="rogue-arena",
     )
