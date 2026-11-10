@@ -601,6 +601,13 @@ marks.
 
 ## Changelog
 
+### 0.5.1
+
+- **Fix: a fresh install could not run an eval.** `agent-client-protocol`
+  1.0.0 removed a module that every supported Inspect version imports, so a
+  new install failed with `No module named 'acp.helpers'`. The package now
+  requires `agent-client-protocol>=0.12.0,<1`.
+
 ### 0.5.0
 
 - **Fix: waiting for a range build.** A trial is now waited for as long as
