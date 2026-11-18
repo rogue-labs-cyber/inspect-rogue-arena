@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import unittest
+import uuid
 from typing import Any
 from unittest.mock import patch
 
@@ -13,7 +14,11 @@ from inspect_rogue_arena.client import (
     EvalActivityEntry,
     EvalChatMessage,
     EvalClaimDenied,
+    EvalGuideNotOffered,
+    EvalJob,
     EvalJobStatus,
+    EvalPromptLevel,
+    EvalProofType,
     EvalReadiness,
     EvalScoringMode,
     EvalTrial,
@@ -27,6 +32,9 @@ from inspect_rogue_arena.client import (
     RogueArenaClient,
     TrialClosedBeforeReady,
     TrialReadyTimeout,
+    sanitize_transcript_file_name,
+    transcript_sha256,
+    transcript_upload_key,
 )
 from inspect_rogue_arena.config import RogueArenaSandboxConfig
 
@@ -40,6 +48,44 @@ def _client(handler) -> RogueArenaClient:
 
 
 class RogueArenaClientSyncTests(unittest.TestCase):
+    def test_a_base_url_must_be_https_so_the_token_never_crosses_in_clear(
+        self,
+    ) -> None:
+        for base_url in (
+            "http://hub.example.test",
+            "http://203.0.113.40:8080",
+            "hub.example.test",
+            "ftp://hub.example.test",
+            "https://",
+            "http://user:secret@hub.example.test",
+        ):
+            with self.subTest(base_url=base_url):
+                with self.assertRaisesRegex(ValueError, "https://") as caught:
+                    RogueArenaClient(base_url, "ra_eval_TOKEN")
+                # never echoes credentials from the URL
+                self.assertNotIn("secret", str(caught.exception))
+
+    def test_plain_http_is_allowed_only_to_this_machine(self) -> None:
+        for base_url in (
+            "https://hub.example.test",
+            "https://hub.example.test/",
+            "HTTPS://Hub.Example.Test",
+            "http://localhost:8080",
+            "http://127.0.0.1",
+            "http://[::1]:3000",
+        ):
+            with self.subTest(base_url=base_url):
+                client = RogueArenaClient(base_url, "ra_eval_TOKEN")
+                self.assertFalse(client.base_url.endswith("/"))
+
+    def test_from_env_refuses_a_plain_http_base_url(self) -> None:
+        env = {
+            "ROGUE_ARENA_BASE_URL": "http://hub.example.test",
+            "ROGUE_ARENA_TOKEN": "ra_eval_TOKEN",
+        }
+        with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
+            RogueArenaClient.from_env()
+
     def test_from_env_requires_base_and_token(self) -> None:
         with patch.dict(os.environ, {}, clear=True), self.assertRaises(RuntimeError):
             RogueArenaClient.from_env()
@@ -142,6 +188,126 @@ class RogueArenaClientAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             EvalReadiness(warm_count=0, on_demand_eta_seconds=None).label(), "on demand"
         )
+
+    async def test_get_eval_guide_is_typed(self) -> None:
+        env_id = "11111111-1111-4111-8111-111111111111"
+        guide = {
+            "environmentId": env_id,
+            "name": "Example AD Chain",
+            "environmentBuildId": "22222222-2222-4222-8222-222222222222",
+            "canvasVersionNumber": 3,
+            "agentMachineNickname": "agent-vm",
+            "scoringMode": "sequential",
+            "hops": [
+                {
+                    "stepNumber": 1,
+                    "name": "foothold",
+                    "description": "pop the web box",
+                    "machineNickname": "web",
+                    "proofType": "keyFile",
+                    "keyFilepath": "/root/flag1.txt",
+                    "command": None,
+                    "regex": None,
+                    "checkScript": None,
+                },
+                {
+                    "stepNumber": 2,
+                    "name": "domain admin",
+                    "description": "own the DC",
+                    "machineNickname": "dc",
+                    "proofType": "commandCheck",
+                    "keyFilepath": None,
+                    "command": "whoami",
+                    "regex": "admin",
+                    "checkScript": None,
+                },
+            ],
+            "solutionWriteup": "web -> app VLAN -> dc",
+            "recommendedPrompts": {"easy": "do X", "medium": "", "hard": "win"},
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.headers["Authorization"], "Bearer ra_eval_TOKEN")
+            self.assertEqual(
+                (request.method, request.url.path),
+                ("GET", f"/hub/eval/evals/{env_id}/guide"),
+            )
+            return httpx.Response(200, json=guide)
+
+        result = await _client(handler).get_eval_guide(env_id)
+        self.assertEqual(result.name, "Example AD Chain")
+        self.assertIs(result.scoring_mode, EvalScoringMode.SEQUENTIAL)
+        self.assertEqual([hop.step_number for hop in result.hops], [1, 2])
+        self.assertIs(result.hops[0].proof_type, EvalProofType.KEY_FILE)
+        self.assertEqual(result.hops[0].key_filepath, "/root/flag1.txt")
+        self.assertIs(result.hops[1].proof_type, EvalProofType.COMMAND_CHECK)
+        self.assertEqual(result.hops[1].regex, "admin")
+        self.assertEqual(result.solution_writeup, "web -> app VLAN -> dc")
+        self.assertEqual(result.prompt(EvalPromptLevel.EASY), "do X")
+        self.assertEqual(result.prompt(EvalPromptLevel.HARD), "win")
+        # a prompt the author left blank is not silently returned
+        with self.assertRaisesRegex(RuntimeError, "no medium recommended prompt"):
+            result.prompt(EvalPromptLevel.MEDIUM)
+
+    async def test_get_eval_guide_escapes_the_id_in_the_path(self) -> None:
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            # raw_path keeps the percent-encoding; .path would decode it
+            seen.append(request.url.raw_path.decode())
+            return httpx.Response(404, json={"errorMessage": "no", "errorSeverity": 2})
+
+        with self.assertRaises(RogueArenaApiError) as ctx:
+            await _client(handler).get_eval_guide("a b/c")
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(seen, ["/hub/eval/evals/a%20b%2Fc/guide"])
+
+    async def test_a_refused_guide_with_a_working_token_is_guides_not_offered(
+        self,
+    ) -> None:
+        def refusing_the_guide(status: int, seen: list[str]):
+            def handler(request: httpx.Request) -> httpx.Response:
+                seen.append(request.url.path)
+                if request.url.path == "/hub/eval/whoami":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "userMainId": "u",
+                            "organizationId": None,
+                            "tokenLabel": "t",
+                            "tokenLast4": "OKEN",
+                        },
+                    )
+                return httpx.Response(status, json={"message": "Unauthorized"})
+
+            return handler
+
+        for status in (401, 302):
+            seen: list[str] = []
+            handler = refusing_the_guide(status, seen)
+            with self.subTest(status=status):
+                with self.assertRaises(EvalGuideNotOffered) as ctx:
+                    await _client(handler).get_eval_guide("env-1")
+                # still a RogueArenaApiError carrying the guide's own answer
+                self.assertIsInstance(ctx.exception, RogueArenaApiError)
+                self.assertEqual(ctx.exception.status_code, status)
+                self.assertEqual(ctx.exception.path, "/hub/eval/evals/env-1/guide")
+                self.assertIn("does not offer eval guides", str(ctx.exception))
+                self.assertEqual(
+                    seen, ["/hub/eval/evals/env-1/guide", "/hub/eval/whoami"]
+                )
+
+    async def test_a_refused_guide_with_a_refused_token_stays_the_guides_error(
+        self,
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"errorMessage": "token expired"})
+
+        with self.assertRaises(RogueArenaApiError) as ctx:
+            await _client(handler).get_eval_guide("env-1")
+        self.assertNotIsInstance(ctx.exception, EvalGuideNotOffered)
+        self.assertEqual(ctx.exception.status_code, 401)
+        self.assertEqual(ctx.exception.path, "/hub/eval/evals/env-1/guide")
 
     async def test_list_runs_parses_the_jobs(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -309,6 +475,78 @@ class RogueArenaClientAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("visibility", created[1])
         await client.create_job(**kwargs)
         self.assertNotIn("visibility", created[2])
+
+    async def test_keep_range_is_sent_only_when_asked_and_read_back(self) -> None:
+        created: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            created.append(body)
+            return httpx.Response(
+                200,
+                json={
+                    **_job_json("open"),
+                    "keepRange": bool(body.get("keepRange")),
+                    "rangeClosedAt": None,
+                },
+            )
+
+        client = _client(handler)
+        kwargs = {
+            "environment_id": "11111111-1111-4111-8111-111111111111",
+            "n": 1,
+            "concurrency": 1,
+            "wall_clock_limit_seconds": 600,
+        }
+        kept = await client.create_job(**kwargs, keep_range=True)
+        self.assertIs(created[0]["keepRange"], True)
+        self.assertTrue(kept.keep_range and kept.range_kept_open)
+        plain = await client.create_job(**kwargs)
+        self.assertNotIn("keepRange", created[1])
+        self.assertFalse(plain.keep_range or plain.range_kept_open)
+        # A hub that predates keep-range answers no field: read as not kept.
+        self.assertFalse(EvalJob.from_dict(_job_json("open")).keep_range)
+        # Every kept range removed (keptRangeCount 0) is no longer kept open, though the range is not closed.
+        emptied = EvalJob.from_dict(
+            {
+                **_job_json("open"),
+                "keepRange": True,
+                "rangeClosedAt": None,
+                "keptRangeCount": 0,
+            }
+        )
+        self.assertEqual(emptied.kept_range_count, 0)
+        self.assertFalse(emptied.range_kept_open)
+        # A hub without the count: kept open until closed, as before.
+        self.assertTrue(
+            EvalJob.from_dict(
+                {**_job_json("open"), "keepRange": True, "rangeClosedAt": None}
+            ).range_kept_open
+        )
+
+    async def test_close_range_posts_an_empty_body_to_the_runs_close_range(
+        self,
+    ) -> None:
+        posts: list[tuple[str, bytes]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            posts.append((request.url.path, request.content))
+            return httpx.Response(
+                200,
+                json={
+                    **_job_json("cancelled"),
+                    "keepRange": True,
+                    "rangeClosedAt": "2026-11-17T21:00:00.000Z",
+                },
+            )
+
+        closed = await _client(handler).close_range("job-1")
+        self.assertEqual(
+            [(path, json.loads(body)) for path, body in posts],
+            [("/hub/eval/jobs/job-1/close-range", {})],
+        )
+        self.assertEqual(closed.range_closed_at, "2026-11-17T21:00:00.000Z")
+        self.assertFalse(closed.range_kept_open)
 
     async def test_create_job_raises_a_visibility_rejection_without_retrying(
         self,
@@ -1248,7 +1486,8 @@ CLAIMED_AT = "2026-11-04T00:00:00.000Z"
 # A provisioning trial's lease is its claim plus the wall clock (one hour here).
 LEASE_AT = "2026-11-04T01:00:00.000Z"
 STALL_REASON = (
-    "expired while provisioning: the copy did not come up within the wall clock"
+    "expired while provisioning: the copy's build made no progress for 30 min "
+    "or ran past 3 h"
 )
 
 
@@ -1285,7 +1524,7 @@ class RogueArenaReadyWaitTests(unittest.IsolatedAsyncioTestCase):
     """The ready wait follows the hub's provisioning state, not a fixed age."""
 
     # the sandbox's default wait, so these pin the shipped behaviour
-    DEFAULT_WAIT = RogueArenaSandboxConfig().ready_wait_seconds
+    DEFAULT_WAIT = RogueArenaSandboxConfig().max_wait_seconds
 
     def _kwargs(self) -> dict[str, object]:
         return {
@@ -1294,30 +1533,22 @@ class RogueArenaReadyWaitTests(unittest.IsolatedAsyncioTestCase):
             "poll_interval_seconds": 30,
         }
 
-    def test_the_default_wait_is_a_two_hour_backstop(self) -> None:
-        self.assertEqual(self.DEFAULT_WAIT, 2 * 60 * 60)
-
-    def test_the_default_backstop_never_ends_before_a_longer_wall_clock(
+    def test_the_default_backstop_outlasts_the_hubs_three_hour_build_limit(
         self,
     ) -> None:
-        # The hub expires a build past the wall clock itself; the client's
-        # default waits 5 minutes beyond it, so the hub's answer lands first.
-        longer = RogueArenaSandboxConfig(max_runtime_seconds=3 * 60 * 60)
-        self.assertEqual(longer.ready_wait_seconds, 3 * 60 * 60 + 5 * 60)
-        at_two_hours = RogueArenaSandboxConfig(max_runtime_seconds=2 * 60 * 60)
-        self.assertEqual(at_two_hours.ready_wait_seconds, 2 * 60 * 60 + 5 * 60)
+        # The hub ends any build 3 hours after its claim; its answer lands first.
+        self.assertEqual(self.DEFAULT_WAIT, 3 * 60 * 60 + 5 * 60)
 
-    def test_an_explicit_max_wait_is_the_backstop_whatever_the_wall_clock(
-        self,
-    ) -> None:
+    def test_the_wall_clock_does_not_change_the_backstop(self) -> None:
+        # Build time no longer spends max_runtime_seconds, so the two are unrelated.
+        longer = RogueArenaSandboxConfig(max_runtime_seconds=6 * 60 * 60)
+        self.assertEqual(longer.max_wait_seconds, self.DEFAULT_WAIT)
+
+    def test_an_explicit_max_wait_is_the_backstop(self) -> None:
         config = RogueArenaSandboxConfig.from_sources(
-            None,
-            environ={
-                "ROGUE_ARENA_MAX_WAIT_SECONDS": "900",
-                "ROGUE_ARENA_MAX_RUNTIME_SECONDS": "10800",
-            },
+            None, environ={"ROGUE_ARENA_MAX_WAIT_SECONDS": "900"}
         )
-        self.assertEqual(config.ready_wait_seconds, 900)
+        self.assertEqual(config.max_wait_seconds, 900)
 
     async def test_a_slow_build_the_hub_still_reports_provisioning_is_waited_for(
         self,
@@ -1355,26 +1586,11 @@ class RogueArenaReadyWaitTests(unittest.IsolatedAsyncioTestCase):
         message = str(error)
         self.assertIn("infraReason=provisioning_failed", message)
         self.assertIn(STALL_REASON, message)
-        # it ended before the lease: a higher wall clock would not have helped
+        # no wall clock runs before ready, so a build never blames it
         self.assertNotIn("max_runtime_seconds", message)
         # the hub already closed it: the client never sends a cancel
         self.assertEqual(hub.closes, [])
         self.assertLess(hub.clock, self.DEFAULT_WAIT)
-
-    async def test_a_build_that_outran_the_wall_clock_says_to_raise_it(
-        self,
-    ) -> None:
-        closed_at = "2026-11-04T01:00:30.000Z"  # past the one-hour lease
-        hub = _ProvisioningHub(
-            ends_at=61 * 60,
-            ends_as=_expired(closed_at),
-            events=_close_events(closed_at, STALL_REASON),
-        )
-
-        with self.assertRaises(TrialClosedBeforeReady) as caught:
-            await hub.client().claim_trial("job-1", **self._kwargs())
-
-        self.assertIn("wall clock (max_runtime_seconds) ran out", str(caught.exception))
 
     async def test_a_close_the_hub_gave_no_reason_for_has_none(self) -> None:
         # Only the claim row and the closing summary: no reason to report, and
@@ -1405,7 +1621,7 @@ class RogueArenaReadyWaitTests(unittest.IsolatedAsyncioTestCase):
     async def test_an_explicit_max_wait_still_overrides_the_backstop(self) -> None:
         explicit = RogueArenaSandboxConfig.from_sources(
             None, environ={"ROGUE_ARENA_MAX_WAIT_SECONDS": "900"}
-        ).ready_wait_seconds
+        ).max_wait_seconds
         hub = _ProvisioningHub(ends_at=40 * 60, ends_as=_trial_json("ready"))
 
         with self.assertRaises(TrialReadyTimeout):
@@ -1437,6 +1653,432 @@ class RogueArenaReadyWaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claim, 900)
         self.assertTrue(polls)
         self.assertTrue(all(timeout == 60 for timeout in polls))
+
+
+class RogueArenaJobModelTests(unittest.IsolatedAsyncioTestCase):
+    """A job carries the model it evaluates, so runs can be compared by model."""
+
+    async def _created_body(self, model: str | None) -> dict[str, object]:
+        created: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            created.append(json.loads(request.content))
+            return httpx.Response(200, json=_job_json("open"))
+
+        await _client(handler).create_job(
+            environment_id="env-1",
+            n=1,
+            concurrency=1,
+            wall_clock_limit_seconds=600,
+            client_job_key="inspect_run",
+            model=model,
+        )
+        return created[0]
+
+    async def test_create_job_sends_the_model_trimmed(self) -> None:
+        body = await self._created_body("  openai/gpt-4o ")
+        self.assertEqual(body["model"], "openai/gpt-4o")
+
+    async def test_create_job_omits_an_unknown_or_blank_model(self) -> None:
+        for model in (None, "", "   "):
+            with self.subTest(model=model):
+                self.assertNotIn("model", await self._created_body(model))
+
+    async def test_create_job_cuts_the_model_at_the_hubs_200_characters(self) -> None:
+        body = await self._created_body("p/" + "m" * 300)
+        self.assertEqual(body["model"], "p/" + "m" * 198)
+        body = await self._created_body("x" * 200)
+        self.assertEqual(body["model"], "x" * 200)
+        # a cut that ends on whitespace is trimmed, as the hub trims it
+        body = await self._created_body("y" * 199 + " " + "z" * 10)
+        self.assertEqual(body["model"], "y" * 199)
+
+    async def test_a_job_carries_the_model_or_none(self) -> None:
+        for model in ("openai/gpt-4o", None):
+            with self.subTest(model=model):
+                job_body = {**_job_json("open"), "model": model}
+                job = await _client(
+                    lambda r, job_body=job_body: httpx.Response(200, json=job_body)
+                ).get_job("job-1")
+                self.assertEqual(job.model, model)
+        # a hub that does not send the field
+        job = await _client(
+            lambda r: httpx.Response(200, json=_job_json("open"))
+        ).get_job("job-1")
+        self.assertIsNone(job.model)
+
+    async def test_a_non_string_job_model_is_refused(self) -> None:
+        job_body = {**_job_json("open"), "model": 7}
+        with self.assertRaisesRegex(TypeError, "model"):
+            await _client(lambda r: httpx.Response(200, json=job_body)).get_job("j")
+
+
+class RogueArenaTranscriptTests(unittest.IsolatedAsyncioTestCase):
+    JOB = "job-1"
+    DATA = b"inspect .eval bytes" * 10
+
+    def _result(self, replayed: bool = False) -> dict[str, object]:
+        return {
+            "transcript": {
+                "id": "t-1",
+                "jobId": self.JOB,
+                "status": "ready",
+                "byteLength": len(self.DATA),
+                "sha256": transcript_sha256(self.DATA),
+                "fileName": "run.eval",
+                "uploadedAt": "2026-11-05T00:00:00.000Z",
+                "readyAt": "2026-11-05T00:00:01.000Z",
+                "expiresAt": "2026-12-05T00:00:00.000Z",
+            },
+            "replayed": replayed,
+        }
+
+    def _clock_client(self, handler: object) -> tuple[RogueArenaClient, list[float]]:
+        slept: list[float] = []
+        clock = {"t": 0.0}
+
+        async def sleep(seconds: float) -> None:
+            slept.append(seconds)
+            clock["t"] += seconds
+
+        client = RogueArenaClient(
+            "https://hub.example.test",
+            "ra_eval_TOKEN",
+            transport=httpx.MockTransport(handler),
+            sleep=sleep,
+            monotonic=lambda: clock["t"],
+        )
+        return client, slept
+
+    async def test_upload_sends_the_required_headers_and_the_raw_bytes(self) -> None:
+        seen: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["method"] = request.method
+            seen["path"] = request.url.path
+            seen["headers"] = dict(request.headers)
+            seen["content"] = request.content
+            return httpx.Response(200, json=self._result())
+
+        result = await _client(handler).upload_transcript(
+            self.JOB,
+            data=self.DATA,
+            idempotency_key="11111111-1111-4111-8111-111111111111",
+            sha256=transcript_sha256(self.DATA),
+            file_name="run.eval",
+        )
+        self.assertEqual(seen["method"], "PUT")
+        self.assertEqual(seen["path"], f"/hub/eval/jobs/{self.JOB}/transcript")
+        headers = seen["headers"]
+        assert isinstance(headers, dict)
+        self.assertEqual(headers["content-type"], "application/octet-stream")
+        self.assertEqual(headers["content-length"], str(len(self.DATA)))
+        self.assertEqual(
+            headers["idempotency-key"], "11111111-1111-4111-8111-111111111111"
+        )
+        self.assertEqual(
+            headers["x-eval-transcript-sha256"], transcript_sha256(self.DATA)
+        )
+        self.assertEqual(headers["x-eval-transcript-file-name"], "run.eval")
+        self.assertEqual(seen["content"], self.DATA)
+        self.assertEqual(result.transcript.id, "t-1")
+        self.assertIs(result.replayed, False)
+
+    def test_the_upload_key_is_a_v4_uuid_stable_for_a_job_and_file(self) -> None:
+        key = transcript_upload_key(self.JOB, "a" * 64)
+        self.assertEqual(uuid.UUID(key).version, 4)
+        # the hub's v4 check also pins the variant
+        self.assertEqual(uuid.UUID(key).variant, uuid.RFC_4122)
+        self.assertEqual(key, transcript_upload_key(self.JOB, "a" * 64))
+        self.assertNotEqual(key, transcript_upload_key(self.JOB, "b" * 64))
+        self.assertNotEqual(key, transcript_upload_key("job-2", "a" * 64))
+
+    async def test_two_separate_shares_of_one_file_use_one_key(self) -> None:
+        # A retry from a new process must resume or replay: the hub refuses a new
+        # key while the run still has a live upload.
+        keys: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            keys.append(request.headers["idempotency-key"])
+            return httpx.Response(200, json=self._result(replayed=len(keys) > 1))
+
+        client, _ = self._clock_client(handler)
+        await client.share_transcript(self.JOB, data=self.DATA)
+        second = await client.share_transcript(self.JOB, data=self.DATA)
+        self.assertEqual(keys[0], keys[1])
+        self.assertIs(second.replayed, True)
+
+    async def test_a_new_upload_can_ask_for_its_own_key(self) -> None:
+        keys: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            keys.append(request.headers["idempotency-key"])
+            return httpx.Response(200, json=self._result())
+
+        client, _ = self._clock_client(handler)
+        chosen = str(uuid.uuid4())
+        await client.share_transcript(self.JOB, data=self.DATA, idempotency_key=chosen)
+        self.assertEqual(keys, [chosen])
+
+    async def test_an_upload_gets_32_minutes_whatever_the_client_wide_timeout(
+        self,
+    ) -> None:
+        # A 100 MB upload on a slow link still ends with Rogue Arena's answer.
+        # A lower client-wide timeout never cuts it.
+        seen: list[dict[str, float]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.extensions["timeout"])
+            return httpx.Response(200, json=self._result())
+
+        for ceiling in (3600.0, 60.0):
+            with self.subTest(request_timeout_seconds=ceiling):
+                seen.clear()
+                client = RogueArenaClient(
+                    "https://hub.example.test",
+                    "ra_eval_TOKEN",
+                    transport=httpx.MockTransport(handler),
+                    request_timeout_seconds=ceiling,
+                )
+                await client.share_transcript(self.JOB, data=self.DATA)
+                self.assertEqual(seen[0]["read"], 32 * 60)
+                self.assertEqual(seen[0]["write"], 32 * 60)
+
+    async def test_share_generates_one_key_and_reuses_it_on_a_retry(self) -> None:
+        keys: list[str] = []
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            keys.append(request.headers["idempotency-key"])
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                # still streaming an earlier send of this key
+                return httpx.Response(
+                    409,
+                    headers={"Retry-After": "7"},
+                    json={"errorMessage": "still uploading", "errorSeverity": 5},
+                )
+            return httpx.Response(200, json=self._result(replayed=True))
+
+        client, slept = self._clock_client(handler)
+        result = await client.share_transcript(
+            self.JOB, data=self.DATA, file_name="run.eval"
+        )
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(keys[0], keys[1])  # same key reused
+        self.assertEqual(slept, [7.0])  # honoured Retry-After
+        self.assertIs(result.replayed, True)
+
+    async def test_share_retries_a_503_on_backoff_then_succeeds(self) -> None:
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts["n"] += 1
+            if attempts["n"] <= 2:
+                return httpx.Response(
+                    503, json={"errorMessage": "storage down", "errorSeverity": 5}
+                )
+            return httpx.Response(200, json=self._result())
+
+        client, slept = self._clock_client(handler)
+        result = await client.share_transcript(self.JOB, data=self.DATA)
+        self.assertEqual(attempts["n"], 3)
+        self.assertEqual(slept, [2.0, 4.0])  # exponential backoff
+        self.assertEqual(result.transcript.job_id, self.JOB)
+
+    async def test_share_honours_retry_after_on_a_503(self) -> None:
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                return httpx.Response(
+                    503,
+                    headers={"Retry-After": "11"},
+                    json={"errorMessage": "storage down", "errorSeverity": 5},
+                )
+            return httpx.Response(200, json=self._result())
+
+        client, slept = self._clock_client(handler)
+        await client.share_transcript(self.JOB, data=self.DATA)
+        self.assertEqual(slept, [11.0])
+
+    async def test_share_retries_a_rate_limit_and_a_gateway_timeout(self) -> None:
+        answers = [
+            httpx.Response(
+                429,
+                headers={"Retry-After": "3"},
+                json={"errorMessage": "slow down", "errorSeverity": 5},
+            ),
+            httpx.Response(504, text="Gateway Time-out"),
+            httpx.Response(200, json=self._result()),
+        ]
+        keys: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            keys.append(request.headers["idempotency-key"])
+            return answers.pop(0)
+
+        client, slept = self._clock_client(handler)
+        await client.share_transcript(self.JOB, data=self.DATA)
+        self.assertEqual(slept, [3.0, 2.0])
+        self.assertEqual(len(set(keys)), 1)
+
+    async def test_share_retries_a_lost_connection_with_the_same_key(self) -> None:
+        keys: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            keys.append(request.headers["idempotency-key"])
+            if len(keys) == 1:
+                raise httpx.ReadError("connection reset", request=request)
+            return httpx.Response(200, json=self._result(replayed=True))
+
+        client, slept = self._clock_client(handler)
+        result = await client.share_transcript(self.JOB, data=self.DATA)
+        self.assertEqual(slept, [2.0])
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(keys[0], keys[1])
+        self.assertIs(result.replayed, True)
+
+    async def test_share_gives_up_on_a_connection_that_stays_lost(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("no route", request=request)
+
+        client, slept = self._clock_client(handler)
+        with self.assertRaises(httpx.ConnectError):
+            await client.share_transcript(self.JOB, data=self.DATA)
+        self.assertLessEqual(sum(slept), 5 * 60 + 30)
+
+    async def test_share_does_not_retry_a_400(self) -> None:
+        # The hub asks for a new key after an integrity mismatch and its body has
+        # no code to tell that from a bad request, so a 400 is final.
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts["n"] += 1
+            return httpx.Response(
+                400, json={"errorMessage": "not the file", "errorSeverity": 5}
+            )
+
+        client, slept = self._clock_client(handler)
+        with self.assertRaises(RogueArenaApiError) as ctx:
+            await client.share_transcript(self.JOB, data=self.DATA)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(attempts["n"], 1)
+        self.assertEqual(slept, [])
+
+    async def test_share_does_not_retry_a_409_without_retry_after(self) -> None:
+        attempts = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts["n"] += 1
+            return httpx.Response(
+                409,
+                json={"errorMessage": "a different transcript", "errorSeverity": 5},
+            )
+
+        client, slept = self._clock_client(handler)
+        with self.assertRaises(RogueArenaApiError) as ctx:
+            await client.share_transcript(self.JOB, data=self.DATA)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(attempts["n"], 1)
+        self.assertEqual(slept, [])
+
+    async def test_share_does_not_retry_a_413_or_404(self) -> None:
+        for status in (413, 404, 401):
+            with self.subTest(status=status):
+                attempts = {"n": 0}
+
+                def handler(
+                    request: httpx.Request,
+                    status: int = status,
+                    attempts: dict[str, int] = attempts,
+                ) -> httpx.Response:
+                    attempts["n"] += 1
+                    return httpx.Response(
+                        status, json={"errorMessage": "no", "errorSeverity": 5}
+                    )
+
+                client, _ = self._clock_client(handler)
+                with self.assertRaises(RogueArenaApiError) as ctx:
+                    await client.share_transcript(self.JOB, data=self.DATA)
+                self.assertEqual(ctx.exception.status_code, status)
+                self.assertEqual(attempts["n"], 1)
+
+    async def test_share_refuses_empty_or_oversize_before_any_request(self) -> None:
+        sent = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent["n"] += 1
+            return httpx.Response(200, json=self._result())
+
+        client, _ = self._clock_client(handler)
+        with self.assertRaisesRegex(ValueError, "empty"):
+            await client.share_transcript(self.JOB, data=b"")
+        from inspect_rogue_arena.client import EVAL_TRANSCRIPT_MAX_BYTES
+
+        with self.assertRaisesRegex(ValueError, "cap"):
+            await client.share_transcript(
+                self.JOB, data=b"x" * (EVAL_TRANSCRIPT_MAX_BYTES + 1)
+            )
+        self.assertEqual(sent["n"], 0)
+
+    async def test_the_cap_is_the_100_mb_rogue_arena_accepts(self) -> None:
+        # Rogue Arena accepts a body of at most 100 MB (decimal), so a file between
+        # that and 100 MiB would pass a higher check and then get a 413.
+        cap = 100_000_000
+        sent: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.append(len(request.content))
+            return httpx.Response(200, json=self._result())
+
+        client, _ = self._clock_client(handler)
+        with self.assertRaisesRegex(ValueError, "cap"):
+            await client.share_transcript(self.JOB, data=b"x" * (cap + 1))
+        self.assertEqual(sent, [])
+        await client.share_transcript(self.JOB, data=b"x" * cap)
+        self.assertEqual(sent, [cap])
+
+    async def test_share_gives_up_at_the_deadline(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                503, json={"errorMessage": "storage down", "errorSeverity": 5}
+            )
+
+        client, slept = self._clock_client(handler)
+        with self.assertRaises(RogueArenaApiError) as ctx:
+            await client.share_transcript(self.JOB, data=self.DATA)
+        self.assertEqual(ctx.exception.status_code, 503)
+        # it stopped within the 5-minute retry deadline
+        self.assertLessEqual(sum(slept), 5 * 60 + 30)
+
+    def test_sanitize_file_name_matches_the_hubs_rule(self) -> None:
+        self.assertEqual(sanitize_transcript_file_name("my run!.eval"), "my-run-.eval")
+        self.assertEqual(sanitize_transcript_file_name("/a/b/c.eval"), "c.eval")
+        self.assertEqual(sanitize_transcript_file_name("report"), "report.eval")
+        # the hub requires a leading letter or digit
+        self.assertEqual(sanitize_transcript_file_name("_run.eval"), "run.eval")
+        self.assertEqual(sanitize_transcript_file_name("+.-run.eval"), "run.eval")
+        # Inspect's own names pass through unchanged
+        inspect_name = "2000-01-02T03-04-05+00-00_my-task_AbCdEf12.eval"
+        self.assertEqual(sanitize_transcript_file_name(inspect_name), inspect_name)
+        self.assertIsNone(sanitize_transcript_file_name(None))
+        self.assertIsNone(sanitize_transcript_file_name("///"))
+        long_name = "x" * 300 + ".eval"
+        sanitized = sanitize_transcript_file_name(long_name)
+        assert sanitized is not None
+        self.assertEqual(len(sanitized), 255)
+        self.assertTrue(sanitized.endswith(".eval"))
+        # a cut that leaves a bad first character is trimmed to a good one
+        trimmed = sanitize_transcript_file_name(
+            "x" * 300 + "_" * 5 + "y" * 245 + ".eval"
+        )
+        self.assertEqual(trimmed, "y" * 245 + ".eval")
+        # nothing usable left: the optional header is simply omitted
+        self.assertIsNone(
+            sanitize_transcript_file_name("x" * 300 + "_" * 251 + ".eval")
+        )
 
 
 class RogueArenaTerminalReasonTests(unittest.TestCase):

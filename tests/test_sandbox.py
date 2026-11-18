@@ -31,6 +31,7 @@ from inspect_ai.util import (
     sandbox,
 )
 
+from inspect_rogue_arena import sandbox as sandbox_module
 from inspect_rogue_arena.client import (
     EvalCatalogEntry,
     EvalClaimDenied,
@@ -45,7 +46,9 @@ from inspect_rogue_arena.client import (
 from inspect_rogue_arena.config import RogueArenaSandboxConfig
 from inspect_rogue_arena.sandbox import (
     RogueArenaSandboxEnvironment,
+    _active_model_name,
     _require_sample_id,
+    _run_id_from_env,
     _TaskRuntime,
     select_eval,
 )
@@ -133,6 +136,17 @@ class FakeHub:
         self.activity: dict[str, list[dict[str, Any]]] = {}
         # A hub without the feed answers the activity route with 404.
         self.activity_supported = True
+        # A hub that predates keep-range answers a job without the field.
+        self.keep_range_supported = True
+        # The eval's targetable machines; None: a hub that predates preseed (404).
+        self.machines: list[dict[str, Any]] | None = [
+            {
+                "machineId": "m-web",
+                "name": "WEB-01",
+                "operatingSystem": "Ubuntu",
+                "agent": False,
+            }
+        ]
         self.status: dict[str, str] = {}
         self.outcome: dict[str, tuple[str | None, str | None]] = {}
         self.files: dict[tuple[str, str], bytes] = {}
@@ -217,9 +231,12 @@ class FakeHub:
             "concurrency": body["concurrency"],
             "wallClockLimitSeconds": body["wallClockLimitSeconds"],
             "clientJobKey": body.get("clientJobKey"),
+            "model": body.get("model"),
             "status": status,
             "trialCount": 0,
             "closedTrialCount": 0,
+            "keepRange": body.get("keepRange", False),
+            "rangeClosedAt": None,
         }
 
     @staticmethod
@@ -255,6 +272,9 @@ class FakeHub:
                     return httpx.Response(200, json=job)
             job_id = f"job-{len(self.jobs) + 1}"
             self.jobs[job_id] = self._job(job_id, body, "open")
+            if not self.keep_range_supported:
+                for key in ("keepRange", "rangeClosedAt"):
+                    self.jobs[job_id].pop(key)
             return httpx.Response(200, json=self.jobs[job_id])
         if (
             method == "POST"
@@ -303,6 +323,14 @@ class FakeHub:
                 return httpx.Response(200, json=entry)
             since = int(request.url.params.get("since", 0) or 0)
             return httpx.Response(200, json=[row for row in feed if row["seq"] > since])
+        if (
+            method == "GET"
+            and path.startswith("/hub/eval/evals/")
+            and parts[-1] == "machines"
+        ):
+            if self.machines is None:
+                return httpx.Response(404, json={"errorMessage": "Not found"})
+            return httpx.Response(200, json=self.machines)
         if (method, path) == ("POST", "/hub/eval/trials"):
             if self.claim_denial is not None:
                 return httpx.Response(self.claim_denial[0], json=self.claim_denial[1])
@@ -459,6 +487,13 @@ class RogueArenaSandboxTests(unittest.IsolatedAsyncioTestCase):
         )
         from_env.start()
         self.addCleanup(from_env.stop)
+        # What Inspect's active model says; the real ones run in the eval tests.
+        self.active_model: str | None = None
+        active_model = patch.object(
+            sandbox_module, "_active_model_name", lambda: self.active_model
+        )
+        active_model.start()
+        self.addCleanup(active_model.stop)
 
     def tearDown(self) -> None:
         RogueArenaSandboxEnvironment._runtimes.clear()
@@ -1290,6 +1325,192 @@ class RogueArenaSandboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.hub.jobs[other_job]["status"], "cancelled")
         self.assertEqual(RogueArenaSandboxEnvironment._runtimes, {})
 
+    async def test_keep_range_is_stored_on_the_job_and_names_the_close_command(
+        self,
+    ) -> None:
+        config = _config(keep_range=True)
+        with self.assertLogs("inspect_rogue_arena", level="INFO") as logs:
+            await RogueArenaSandboxEnvironment.task_init("startup", config)
+            await self._sample(config, "s-1")
+
+        jobs = self.hub.calls("POST", "/hub/eval/jobs")
+        self.assertEqual(len(jobs), 1)
+        self.assertIs(jobs[0]["keepRange"], True)
+        self.assertTrue(
+            any(
+                "rogue-arena-inspect close job-1" in line and "WARNING" in line
+                for line in logs.output
+            ),
+            logs.output,
+        )
+
+    async def test_a_hub_that_cannot_keep_the_range_fails_the_run_before_any_trial(
+        self,
+    ) -> None:
+        self.hub.keep_range_supported = False
+        config = _config(keep_range=True)
+        with self.assertRaisesRegex(RuntimeError, "does not support keep_range"):
+            await RogueArenaSandboxEnvironment.task_init("startup", config)
+        self.assertEqual(self.hub.calls("POST", "/hub/eval/trials"), [])
+
+    async def test_a_preseed_rides_every_claim_and_a_bad_file_fails_before_any_job(
+        self,
+    ) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
+            handle.write(
+                "steps:\n  - target: WEB-01\n    shell: bash\n    script: touch /tmp/x\n"
+            )
+        self.addCleanup(os.unlink, handle.name)
+        config = _config(preseed=handle.name)
+        await RogueArenaSandboxEnvironment.task_init("startup", config)
+        await self._sample(config, "s-1")
+        await self._sample(config, "s-2")
+
+        claims = self.hub.calls("POST", "/hub/eval/trials")
+        self.assertEqual(len(claims), 2)
+        for claim in claims:
+            self.assertEqual(
+                claim["preseed"],
+                [
+                    {
+                        "target": "WEB-01",
+                        "shell": "bash",
+                        "timeoutSeconds": 600,
+                        "script": "touch /tmp/x",
+                    }
+                ],
+            )
+
+        self.hub.requests.clear()
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as unknown:
+            unknown.write(
+                "steps:\n  - target: DB-99\n    shell: bash\n    script: echo hi\n"
+            )
+        self.addCleanup(os.unlink, unknown.name)
+        with self.assertRaisesRegex(ValueError, "names no machine of this eval"):
+            await RogueArenaSandboxEnvironment.task_init(
+                "startup", _config(preseed=unknown.name)
+            )
+        self.assertEqual(self.hub.calls("POST", "/hub/eval/jobs"), [])
+
+        self.hub.machines = None
+        with self.assertRaisesRegex(RuntimeError, "does not support preseed"):
+            await RogueArenaSandboxEnvironment.task_init(
+                "startup", _config(preseed=handle.name, max_trials=7)
+            )
+        self.assertEqual(self.hub.calls("POST", "/hub/eval/jobs"), [])
+
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as bad:
+            bad.write("steps: []\n")
+        self.addCleanup(os.unlink, bad.name)
+        bad_config = _config(preseed=bad.name)
+        with self.assertRaisesRegex(ValueError, "at least one step"):
+            await RogueArenaSandboxEnvironment.task_init("startup", bad_config)
+        self.assertEqual(self.hub.calls("POST", "/hub/eval/jobs"), [])
+
+    async def test_a_claim_without_a_preseed_sends_no_preseed_field(self) -> None:
+        config = _config()
+        await RogueArenaSandboxEnvironment.task_init("startup", config)
+        await self._sample(config, "s-1")
+        self.assertNotIn("preseed", self.hub.calls("POST", "/hub/eval/trials")[0])
+
+    async def test_the_job_leaves_out_the_model_when_none_is_known(self) -> None:
+        config = _config()
+        await RogueArenaSandboxEnvironment.task_init("startup", config)
+        await self._sample(config, "s-1")
+
+        jobs = self.hub.calls("POST", "/hub/eval/jobs")
+        self.assertEqual(len(jobs), 1)
+        self.assertNotIn("model", jobs[0])
+
+    async def test_each_model_of_a_run_gets_its_own_labelled_job(self) -> None:
+        # Inspect runs task_init once per config, under the last model it resolved,
+        # and each model's samples under that model.
+        config = _config()
+        self.active_model = "mockllm/other"
+        await RogueArenaSandboxEnvironment.task_init("startup", config)
+        other = await self._sample(config, "s-1")
+        self.active_model = "mockllm/model"
+        first = await self._sample(config, "s-1")
+        second = await self._sample(config, "s-2")
+
+        self.assertEqual(len(RogueArenaSandboxEnvironment._runtimes), 2)
+        jobs = {job["model"]: job_id for job_id, job in self.hub.jobs.items()}
+        self.assertEqual(set(jobs), {"mockllm/other", "mockllm/model"})
+        claims = self.hub.calls("POST", "/hub/eval/trials")
+        self.assertEqual(
+            [claim["jobId"] for claim in claims],
+            [jobs["mockllm/other"], jobs["mockllm/model"], jobs["mockllm/model"]],
+        )
+        # two models never share a job key
+        keys = [job["clientJobKey"] for job in self.hub.calls("POST", "/hub/eval/jobs")]
+        self.assertEqual(len(set(keys)), 2)
+
+        for environments in (other, first, second):
+            await RogueArenaSandboxEnvironment.sample_cleanup(
+                "task", config, environments, False
+            )
+        # one task_cleanup per config cancels every model's job
+        await RogueArenaSandboxEnvironment.task_cleanup("shutdown", config, True)
+        self.assertEqual(
+            {job["status"] for job in self.hub.jobs.values()}, {"cancelled"}
+        )
+        self.assertEqual(RogueArenaSandboxEnvironment._runtimes, {})
+
+    async def test_cleanup_cancels_only_this_configs_jobs_for_every_model(self) -> None:
+        shared, other = _config(max_trials=2), _config(max_trials=5)
+        self.active_model = "mockllm/a"
+        await RogueArenaSandboxEnvironment.task_init("startup", shared)
+        await RogueArenaSandboxEnvironment.task_init("startup", other)
+        self.active_model = "mockllm/b"
+        await self._sample(shared, "s-1")
+
+        await RogueArenaSandboxEnvironment.task_cleanup("shutdown", shared, True)
+
+        cancelled = {
+            job_id
+            for job_id, job in self.hub.jobs.items()
+            if job["status"] == "cancelled"
+        }
+        by_config = {
+            job_id: job["n"]
+            for job_id, job in self.hub.jobs.items()
+            if job["status"] == "open"
+        }
+        self.assertEqual(len(cancelled), 2)
+        # the other sandbox config's job and runtime are untouched
+        self.assertEqual(list(by_config.values()), [5])
+        self.assertEqual(len(RogueArenaSandboxEnvironment._runtimes), 1)
+
+    async def test_a_failed_cleanup_of_one_model_still_cleans_up_the_other(
+        self,
+    ) -> None:
+        config = _config()
+        self.active_model = "mockllm/a"
+        await RogueArenaSandboxEnvironment.task_init("startup", config)
+        self.active_model = "mockllm/b"
+        await RogueArenaSandboxEnvironment.task_init("startup", config)
+        failing = {
+            job_id
+            for job_id, job in self.hub.jobs.items()
+            if job["model"] == "mockllm/a"
+        }
+        original = sandbox_module._cancel_job
+        cancelled: list[str] = []
+
+        async def cancel(client: RogueArenaClient, job_id: str) -> None:
+            if job_id in failing:
+                raise RuntimeError("cancel failed")
+            cancelled.append(job_id)
+            await original(client, job_id)
+
+        with patch.object(sandbox_module, "_cancel_job", cancel):
+            await RogueArenaSandboxEnvironment.task_cleanup("shutdown", config, True)
+
+        self.assertEqual(len(cancelled), 1)
+        self.assertNotIn(cancelled[0], failing)
+        self.assertEqual(RogueArenaSandboxEnvironment._runtimes, {})
+
     async def test_job_create_retries_a_transport_error_with_the_same_key(
         self,
     ) -> None:
@@ -1311,6 +1532,126 @@ def _without_rogue_arena_env() -> dict[str, str]:
         for key, value in os.environ.items()
         if not key.startswith("ROGUE_ARENA_")
     }
+
+
+class TrialClockTests(unittest.IsolatedAsyncioTestCase):
+    """The hub starts a trial's wall clock when its range is ready, so the client does."""
+
+    def setUp(self) -> None:
+        RogueArenaSandboxEnvironment._runtimes.clear()
+
+    async def test_a_slow_claim_does_not_spend_the_trials_wall_clock(self) -> None:
+        build_seconds = 0.3
+
+        class SlowClaimHub(FakeHub):
+            async def handler(self, request: httpx.Request) -> httpx.Response:
+                if (request.method, request.url.path) == ("POST", "/hub/eval/trials"):
+                    await asyncio.sleep(build_seconds)
+                return await super().handler(request)
+
+        hub = SlowClaimHub(self)
+        config = _config(max_runtime_seconds=600)
+        with (
+            patch.dict(os.environ, _without_rogue_arena_env(), clear=True),
+            patch.object(RogueArenaClient, "from_env", return_value=hub.client()),
+        ):
+            await RogueArenaSandboxEnvironment.task_init("startup", config)
+            environments = await RogueArenaSandboxEnvironment.sample_init(
+                "task", config, {"__sample_id__": "s-1"}
+            )
+            ready = time.monotonic()
+            environment = _env(environments)
+            remaining = environment._deadline - ready
+            await environment.close_trial()
+            await RogueArenaSandboxEnvironment.sample_cleanup(
+                "task", config, environments, False
+            )
+            await RogueArenaSandboxEnvironment.task_cleanup("shutdown", config, True)
+
+        # the whole wall clock is left at ready, none of it spent on the claim
+        self.assertGreater(remaining, 600 - build_seconds / 2)
+        self.assertLessEqual(remaining, 600)
+
+
+class TwoModelInspectRunTests(unittest.TestCase):
+    """A real (offline) `inspect_ai.eval()` over two models: one labelled job each."""
+
+    def test_a_run_over_two_models_labels_one_job_per_model(self) -> None:
+        hub = FakeHub(self)
+        task = Task(
+            dataset=[Sample(input=f"q{n}", id=f"s-{n}") for n in range(1, 3)],
+            scorer=rogue_arena_hops(),
+            sandbox=SandboxEnvironmentSpec("rogue-arena", _config(max_trials=2)),
+            name="two_model_task",
+        )
+        RogueArenaSandboxEnvironment._runtimes.clear()
+        with (
+            tempfile.TemporaryDirectory() as log_dir,
+            patch.dict(os.environ, _without_rogue_arena_env(), clear=True),
+            patch.object(RogueArenaClient, "from_env", return_value=hub.client()),
+        ):
+            logs = inspect_eval(
+                task,
+                model=["mockllm/model", "mockllm/other"],
+                log_dir=log_dir,
+                display="none",
+            )
+            self.assertEqual([log.status for log in logs], ["success", "success"])
+
+        self.assertEqual(len(hub.jobs), 2)
+        jobs = {job["model"]: job_id for job_id, job in hub.jobs.items()}
+        self.assertEqual(set(jobs), {"mockllm/model", "mockllm/other"})
+        claims = hub.calls("POST", "/hub/eval/trials")
+        self.assertEqual(
+            sorted(claim["jobId"] for claim in claims),
+            sorted([jobs["mockllm/model"]] * 2 + [jobs["mockllm/other"]] * 2),
+        )
+        self.assertEqual({job["status"] for job in hub.jobs.values()}, {"cancelled"})
+        self.assertEqual(RogueArenaSandboxEnvironment._runtimes, {})
+
+
+class ActiveModelNameTests(unittest.TestCase):
+    """Outside an eval; the eval tests cover Inspect's active model."""
+
+    def test_no_model_is_none(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(_active_model_name())
+
+    def test_inspects_none_model_is_none(self) -> None:
+        with patch.dict(os.environ, {"INSPECT_EVAL_MODEL": "none"}, clear=True):
+            self.assertIsNone(_active_model_name())
+
+    def test_a_model_that_cannot_load_is_none(self) -> None:
+        with patch.object(
+            sandbox_module, "get_model", side_effect=RuntimeError("no API key")
+        ):
+            self.assertIsNone(_active_model_name())
+
+
+class RunIdFromEnvTests(unittest.TestCase):
+    """ROGUE_ARENA_RUN_ID prefixes the run id, so launch --share-transcript can find
+    the job; without it the run id is random."""
+
+    def test_the_override_prefixes_a_unique_run_id(self) -> None:
+        with patch.dict(os.environ, {"ROGUE_ARENA_RUN_ID": "fixed-run-7"}):
+            first, second = _run_id_from_env(), _run_id_from_env()
+            runtime = _TaskRuntime(
+                config=RogueArenaSandboxConfig(eval=ENV_ID),
+                client=FakeHub(self).client(),
+            )
+        self.assertTrue(first.startswith("fixed-run-7-"))
+        self.assertTrue(runtime.run_id.startswith("fixed-run-7-"))
+        # two sandbox configs in one run never share a job key
+        self.assertNotEqual(first, second)
+
+    def test_a_blank_or_absent_override_is_a_random_uuid(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "ROGUE_ARENA_RUN_ID"}
+        with patch.dict(os.environ, env, clear=True):
+            first, second = _run_id_from_env(), _run_id_from_env()
+            self.assertNotEqual(first, second)
+            self.assertEqual(len(first), 36)
+        with patch.dict(os.environ, {"ROGUE_ARENA_RUN_ID": "  "}):
+            self.assertEqual(len(_run_id_from_env()), 36)
 
 
 class InspectEvalSmokeTests(unittest.TestCase):
@@ -1394,6 +1735,10 @@ class InspectEvalSmokeTests(unittest.TestCase):
         self.assertEqual(len(claims), 4)
         self.assertEqual({claim["inspectTaskId"] for claim in claims}, {"smoke_task"})
         self.assertLessEqual(hub.peak_open_trials, 2)
+        # the job is labelled with the model Inspect ran
+        self.assertEqual(
+            hub.calls("POST", "/hub/eval/jobs")[0]["model"], "mockllm/model"
+        )
         for trial_id in ("trial-1", "trial-2", "trial-3", "trial-4"):
             self.assertEqual(
                 hub.calls("POST", f"/hub/eval/trials/{trial_id}/close"),

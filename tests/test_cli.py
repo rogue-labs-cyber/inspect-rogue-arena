@@ -1,24 +1,36 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
+import importlib.util
 import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from functools import partial
 from importlib import resources
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 from unittest.mock import patch
 
 import httpx
 
-from inspect_rogue_arena.cli import _PARALLEL_FLAGS, build_parser, main
-from inspect_rogue_arena.client import RogueArenaClient
+from inspect_rogue_arena.cli import (
+    _PARALLEL_FLAGS,
+    _log_facts,
+    _LogFacts,
+    build_parser,
+    main,
+)
+from inspect_rogue_arena.client import RogueArenaClient, transcript_upload_key
 from inspect_rogue_arena.config import RogueArenaSandboxConfig
 
 BASE_URL = "https://hub.example.test"
@@ -209,7 +221,16 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(len(subcommands), 1)
         self.assertEqual(
             set(subcommands[0].choices),
-            {"whoami", "evals", "runs", "run", "launch"},
+            {
+                "whoami",
+                "evals",
+                "runs",
+                "run",
+                "eval",
+                "launch",
+                "share-transcript",
+                "close",
+            },
         )
 
     def test_unknown_subcommands_exit_2_without_a_request(self) -> None:
@@ -233,6 +254,29 @@ class CliParserTests(unittest.TestCase):
                 self.assertEqual(run.code, 2)
                 self.assertIn("unrecognized arguments", run.stderr)
                 self.assertEqual(run.requests, ())
+
+
+class CliBaseUrlTests(unittest.TestCase):
+    def test_a_plain_http_base_url_is_refused_before_any_request(self) -> None:
+        run = _run(["whoami"], env={**ENV, "ROGUE_ARENA_BASE_URL": "http://hub.test"})
+
+        self.assertEqual(run.code, 1)
+        self.assertIn("https://", run.stderr)
+        self.assertEqual(run.requests, ())
+        self.assertNotIn(TOKEN, run.stderr + run.stdout)
+
+    def test_launch_refuses_a_plain_http_base_url_before_starting_inspect(
+        self,
+    ) -> None:
+        code, cmd, _, stderr = _launch(
+            ["launch", "--model", "m", "--eval", "x"],
+            env={**ENV, "ROGUE_ARENA_BASE_URL": "http://hub.test"},
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIsNone(cmd)
+        self.assertIn("https://", stderr)
+        self.assertNotIn(TOKEN, stderr)
 
 
 class CliWhoamiTests(unittest.TestCase):
@@ -415,6 +459,225 @@ class CliRunsTests(unittest.TestCase):
         self.assertEqual(run.stdout.strip(), "this token has no runs yet")
 
 
+GUIDE_ENV_ID = "11111111-1111-4111-8111-111111111111"
+GUIDE = {
+    "environmentId": GUIDE_ENV_ID,
+    "name": "Example AD Chain",
+    "environmentBuildId": "22222222-2222-4222-8222-222222222222",
+    "canvasVersionNumber": 3,
+    "agentMachineNickname": "agent-vm",
+    "scoringMode": "sequential",
+    "hops": [
+        {
+            "stepNumber": 1,
+            "name": "foothold",
+            "description": "pop the web box",
+            "machineNickname": "web",
+            "proofType": "keyFile",
+            "keyFilepath": "/root/flag1.txt",
+            "command": None,
+            "regex": None,
+            "checkScript": None,
+        },
+        {
+            "stepNumber": 2,
+            "name": "domain admin",
+            "description": "own the DC",
+            "machineNickname": "dc",
+            "proofType": "commandCheck",
+            "keyFilepath": None,
+            "command": "whoami",
+            "regex": "admin",
+            "checkScript": None,
+        },
+    ],
+    "solutionWriteup": "web -> app VLAN -> dc",
+    "recommendedPrompts": {"easy": "do the easy thing", "medium": "", "hard": "win"},
+}
+
+
+def _guide_hub() -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/hub/eval/evals/{GUIDE_ENV_ID}/guide":
+            return httpx.Response(200, json=GUIDE)
+        return httpx.Response(404, json={"errorMessage": "not found"})
+
+    return handler
+
+
+class CliEvalGuideTests(unittest.TestCase):
+    def test_guide_renders_graders_solution_and_prompts(self) -> None:
+        run = _run(["eval", GUIDE_ENV_ID, "--guide"], _guide_hub())
+
+        self.assertEqual(run.code, 0)
+        out = run.stdout
+        self.assertIn("Example AD Chain", out)
+        self.assertIn("#1 foothold", out)
+        self.assertIn("key file at /root/flag1.txt", out)
+        self.assertIn("`whoami`", out)
+        self.assertIn("/admin/", out)
+        self.assertIn("web -> app VLAN -> dc", out)
+        # every level appears; the blank one says so
+        self.assertIn("easy:", out)
+        self.assertIn("do the easy thing", out)
+        self.assertIn("(none written)", out)
+        self.assertEqual(
+            run.requests[0].url.path, f"/hub/eval/evals/{GUIDE_ENV_ID}/guide"
+        )
+
+    def test_guide_is_the_default_view_without_the_flag(self) -> None:
+        # the read is the same whether or not --guide is passed
+        run = _run(["eval", GUIDE_ENV_ID], _guide_hub())
+        self.assertEqual(run.code, 0)
+        self.assertIn("Graders", run.stdout)
+
+    def test_prompt_level_prints_only_that_prompt(self) -> None:
+        for level, expected in (("easy", "do the easy thing"), ("hard", "win")):
+            with self.subTest(level=level):
+                run = _run(
+                    ["eval", GUIDE_ENV_ID, "--prompt-level", level], _guide_hub()
+                )
+                self.assertEqual(run.code, 0)
+                self.assertEqual(run.stdout.strip(), expected)
+                # only the prompt, not the graders or solution
+                self.assertNotIn("Graders", run.stdout)
+                self.assertNotIn("web -> app", run.stdout)
+
+    def test_a_blank_recommended_prompt_is_an_error_not_empty_output(self) -> None:
+        run = _run(["eval", GUIDE_ENV_ID, "--prompt-level", "medium"], _guide_hub())
+        self.assertEqual(run.code, 1)
+        self.assertIn("no medium recommended prompt", run.stderr)
+        self.assertEqual(run.stdout, "")
+
+    def test_json_prints_the_raw_guide(self) -> None:
+        run = _run(["eval", GUIDE_ENV_ID, "--json"], _guide_hub())
+        self.assertEqual(run.code, 0)
+        self.assertEqual(json.loads(run.stdout)["environmentId"], GUIDE_ENV_ID)
+
+    def test_an_eval_the_token_cannot_run_is_a_clear_error(self) -> None:
+        run = _run(["eval", "99999999-9999-4999-8999-999999999999", "--guide"])
+        self.assertEqual(run.code, 1)
+        self.assertNotIn(TOKEN, run.stderr)
+
+    def test_an_eval_name_resolves_through_the_listing(self) -> None:
+        run = _run(["eval", "ad-chain", "--guide"], _guide_catalog_hub())
+        self.assertEqual(run.code, 0)
+        self.assertIn("Example AD Chain", run.stdout)
+
+    def test_an_unknown_eval_name_is_a_clear_error(self) -> None:
+        run = _run(["eval", "no-such-eval", "--guide"], _guide_catalog_hub())
+        self.assertEqual(run.code, 1)
+        self.assertIn("no-such-eval", run.stderr)
+
+    def test_an_unknown_prompt_level_exits_2(self) -> None:
+        run = _run(["eval", GUIDE_ENV_ID, "--prompt-level", "trivial"], _guide_hub())
+        self.assertEqual(run.code, 2)
+        self.assertIn("invalid choice", run.stderr)
+
+    def test_a_served_guide_takes_one_request(self) -> None:
+        run = _run(["eval", GUIDE_ENV_ID, "--guide"], _guide_hub())
+        self.assertEqual(run.code, 0)
+        self.assertEqual(
+            [request.url.path for request in run.requests],
+            [f"/hub/eval/evals/{GUIDE_ENV_ID}/guide"],
+        )
+
+
+def _hub_refusing_the_guide(
+    guide_status: int, *, whoami_status: int = 200, evals: bool = False
+) -> Handler:
+    """A server whose guide route answers ``guide_status`` (a gateway that does
+    not let tokens through to it); whoami answers ``whoami_status``."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/guide"):
+            if 300 <= guide_status < 400:
+                return httpx.Response(
+                    guide_status, headers={"Location": "https://sso.example/login"}
+                )
+            return httpx.Response(guide_status, json={"message": "Unauthorized"})
+        if path == "/hub/eval/whoami":
+            if whoami_status == 200:
+                return httpx.Response(200, json=WHOAMI)
+            return httpx.Response(
+                whoami_status, json={"errorMessage": "Eval service token expired"}
+            )
+        if evals and path == "/hub/eval/evals":
+            return httpx.Response(
+                200,
+                json=[{**EVALS[0], "environmentId": GUIDE_ENV_ID, "name": "ad-chain"}],
+            )
+        return httpx.Response(404, json={"errorMessage": "not found"})
+
+    return handler
+
+
+class CliEvalGuideNotOfferedTests(unittest.TestCase):
+    """A server that does not serve the guide route to tokens is named as such,
+    not blamed on a token that works."""
+
+    def test_a_401_on_the_guide_with_a_working_token_says_guides_are_not_offered(
+        self,
+    ) -> None:
+        for argv in (
+            ["eval", GUIDE_ENV_ID, "--guide"],
+            ["eval", GUIDE_ENV_ID, "--prompt-level", "hard"],
+            ["eval", "ad-chain", "--json"],
+        ):
+            with self.subTest(argv=argv):
+                run = _run(argv, _hub_refusing_the_guide(401, evals=True))
+                self.assertEqual(run.code, 1)
+                self.assertEqual(run.stdout, "")
+                self.assertIn("does not offer eval guides", run.stderr)
+                self.assertIn("HTTP 401", run.stderr)
+                self.assertIn("your token works", run.stderr)
+                self.assertNotIn("rejected the token", run.stderr)
+                self.assertNotIn(TOKEN, run.output)
+                self.assertEqual(run.requests[-1].url.path, "/hub/eval/whoami")
+
+    def test_a_redirect_on_the_guide_with_a_working_token_says_the_same(
+        self,
+    ) -> None:
+        run = _run(["eval", GUIDE_ENV_ID, "--guide"], _hub_refusing_the_guide(302))
+        self.assertEqual(run.code, 1)
+        self.assertIn("does not offer eval guides", run.stderr)
+        self.assertIn("HTTP 302", run.stderr)
+        self.assertNotIn("redirected the request", run.stderr)
+
+    def test_a_token_that_whoami_also_rejects_is_still_blamed_on_the_token(
+        self,
+    ) -> None:
+        run = _run(
+            ["eval", GUIDE_ENV_ID, "--guide"],
+            _hub_refusing_the_guide(401, whoami_status=401),
+        )
+        self.assertEqual(run.code, 1)
+        self.assertIn("rejected the token (HTTP 401", run.stderr)
+        self.assertNotIn("does not offer eval guides", run.stderr)
+
+    def test_launch_prompt_level_stops_before_the_child_with_the_same_message(
+        self,
+    ) -> None:
+        code, cmd, _, stderr = _launch(
+            [
+                "launch",
+                "--model",
+                "m",
+                "--eval",
+                GUIDE_ENV_ID,
+                "--prompt-level",
+                "hard",
+            ],
+            client_handler=_hub_refusing_the_guide(401),
+        )
+        self.assertEqual(code, 1)
+        self.assertIsNone(cmd)
+        self.assertIn("does not offer eval guides", stderr)
+        self.assertNotIn("rejected the token", stderr)
+        self.assertNotIn(TOKEN, stderr)
+
+
 class CliRunTests(unittest.TestCase):
     def test_run_shows_job_status_and_per_stage_score(self) -> None:
         run = _run(["run", "job-1"], _runs_hub())
@@ -519,6 +782,109 @@ def _chat_hub(
         return httpx.Response(404, json={"errorMessage": "not found"})
 
     return handler
+
+
+KEPT_JOB = {
+    **JOBS[0],
+    "status": "cancelled",
+    "keepRange": True,
+    "rangeClosedAt": None,
+}
+CLOSED_AT = "2026-11-17T21:00:00.000Z"
+
+
+def _close_hub(job: Mapping[str, object] = KEPT_JOB) -> Handler:
+    """A hub holding one run; ``close-range`` closes its kept range once."""
+    state: dict[str, object] = dict(job)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        method, path = request.method, request.url.path
+        if (method, path) == ("GET", "/hub/eval/jobs/job-1"):
+            return httpx.Response(200, json=state)
+        if (method, path) == ("POST", "/hub/eval/jobs/job-1/close-range"):
+            if state.get("keepRange") and state.get("rangeClosedAt") is None:
+                state["rangeClosedAt"] = CLOSED_AT
+            return httpx.Response(200, json=state)
+        if method == "GET" and path == "/hub/eval/jobs/trial-1":
+            return httpx.Response(404, json={"errorMessage": "no job"})
+        if method == "GET" and path == "/hub/eval/trials/trial-1":
+            return httpx.Response(200, json=TRIALS[0])
+        return httpx.Response(404, json={"errorMessage": "not found"})
+
+    return handler
+
+
+def _posts(run: CliRun) -> list[str]:
+    return [request.url.path for request in run.requests if request.method == "POST"]
+
+
+class CliCloseTests(unittest.TestCase):
+    def test_close_closes_a_kept_range_once(self) -> None:
+        run = _run(["close", "job-1"], _close_hub())
+        self.assertEqual(run.code, 0, run.output)
+        self.assertEqual(_posts(run), ["/hub/eval/jobs/job-1/close-range"])
+        self.assertIn(f"run job-1: range closed at {CLOSED_AT}", run.stdout)
+        self.assertIn("removing every range the run kept up", run.stdout)
+        self.assertNotIn(TOKEN, run.output)
+
+    def test_closing_twice_is_fine(self) -> None:
+        run = _run(
+            ["close", "job-1"], _close_hub({**KEPT_JOB, "rangeClosedAt": CLOSED_AT})
+        )
+        self.assertEqual(run.code, 0, run.output)
+        self.assertIn(f"its range was already closed at {CLOSED_AT}", run.stdout)
+
+    def test_a_run_without_keep_range_has_nothing_to_close(self) -> None:
+        run = _run(["close", "job-1"], _close_hub(JOBS[0]))
+        self.assertEqual(run.code, 0, run.output)
+        self.assertEqual(_posts(run), [])
+        self.assertIn("was not launched with --keep-range", run.stdout)
+        as_json = _run(["close", "job-1", "--json"], _close_hub(JOBS[0]))
+        self.assertEqual(json.loads(as_json.stdout)["run"]["id"], "job-1")
+        self.assertEqual(_posts(as_json), [])
+
+    def test_close_takes_a_trial_id_for_its_run(self) -> None:
+        run = _run(["close", "trial-1"], _close_hub())
+        self.assertEqual(run.code, 0, run.output)
+        self.assertEqual(_posts(run), ["/hub/eval/jobs/job-1/close-range"])
+
+    def test_another_users_run_reads_as_not_found(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"errorMessage": "Not found"})
+
+        run = _run(["close", "job-9"], handler)
+        self.assertEqual(run.code, 1)
+        self.assertEqual(_posts(run), [])
+        self.assertIn("no run or trial found with id 'job-9'", run.stderr)
+
+    def test_close_json_prints_the_closed_run(self) -> None:
+        run = _run(["close", "job-1", "--json"], _close_hub())
+        self.assertEqual(run.code, 0, run.output)
+        self.assertEqual(json.loads(run.stdout)["run"]["rangeClosedAt"], CLOSED_AT)
+
+    def test_run_never_says_kept_open_once_every_kept_range_was_removed(self) -> None:
+        # The owner removed both kept copies on the web: the range is still open, no range is up.
+        removed = {**KEPT_JOB, "keptRangeCount": 0}
+        run = _run(["run", "job-1"], _runs_hub(job=removed))
+        self.assertEqual(run.code, 0, run.output)
+        self.assertNotIn("range kept open", run.stdout)
+        self.assertNotIn("rogue-arena-inspect close", run.stdout)
+        self.assertIn("no kept range up", run.stdout)
+        kept = _run(["run", "job-1"], _runs_hub(job={**KEPT_JOB, "keptRangeCount": 2}))
+        self.assertIn("range kept open (2 up)", kept.stdout)
+
+    def test_run_shows_a_kept_range_and_how_to_close_it(self) -> None:
+        run = _run(["run", "job-1"], _runs_hub(job=KEPT_JOB))
+        self.assertEqual(run.code, 0, run.output)
+        self.assertIn("range kept open", run.stdout)
+        self.assertIn("rogue-arena-inspect close job-1", run.stdout)
+        closed = _run(
+            ["run", "job-1"], _runs_hub(job={**KEPT_JOB, "rangeClosedAt": CLOSED_AT})
+        )
+        self.assertIn("range closed", closed.stdout)
+        self.assertNotIn("rogue-arena-inspect close", closed.stdout)
+        plain = _run(["run", "job-1"], _runs_hub())
+        self.assertNotIn("range", plain.stdout.split("\n")[0])
 
 
 class CliRunChatTests(unittest.TestCase):
@@ -658,11 +1024,16 @@ def _launch(
     *,
     returncode: int = 0,
     child_stderr: Sequence[str] = (),
+    on_spawn: Callable[[list[str], dict[str, str]], None] | None = None,
+    client_handler: Handler | None = None,
 ) -> tuple[int | str | None, list[str] | None, dict[str, str] | None, str]:
     """Run ``launch`` with ``subprocess.Popen`` stubbed; capture its cmd and env.
 
     ``returncode``/``child_stderr`` simulate the ``inspect eval`` child, so a
-    failing run with provider-policy stderr can be exercised.
+    failing run with provider-policy stderr can be exercised. ``on_spawn`` runs
+    with the child's cmd and env (e.g. to write a ``.eval`` into its log dir),
+    and ``client_handler`` puts every ``RogueArenaClient`` on a MockTransport,
+    so the post-run transcript upload hits the fake hub, not the network.
     """
     captured: dict[str, object] = {}
 
@@ -677,18 +1048,32 @@ def _launch(
         ) -> None:
             captured["cmd"] = cmd
             captured["env"] = env
+            if on_spawn is not None:
+                on_spawn(cmd, env)
             self.stderr = iter(list(child_stderr))
 
         def wait(self) -> int:
             return returncode
 
     stderr = io.StringIO()
-    with (
+    patches = [
         patch.dict(os.environ, dict(env), clear=True),
         patch("inspect_rogue_arena.cli.subprocess.Popen", _FakePopen),
         redirect_stdout(io.StringIO()),
         redirect_stderr(stderr),
-    ):
+    ]
+    if client_handler is not None:
+        patches.append(
+            patch(
+                "inspect_rogue_arena.cli.RogueArenaClient",
+                partial(
+                    RogueArenaClient, transport=httpx.MockTransport(client_handler)
+                ),
+            )
+        )
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
         try:
             code: int | str | None = main(argv)
         except SystemExit as exited:
@@ -888,6 +1273,69 @@ class CliLaunchTests(unittest.TestCase):
             self.assertNotIn(flag, cmd)
         self.assertNotIn("ROGUE_ARENA_CONCURRENCY", env)
 
+    def test_launch_without_share_transcript_sets_no_run_id_and_no_log_dir(
+        self,
+    ) -> None:
+        code, cmd, env, _ = _launch(["launch", "--model", "m", "--eval", "x"])
+        assert cmd is not None and env is not None
+        self.assertEqual(code, 0)
+        self.assertNotIn("ROGUE_ARENA_RUN_ID", env)
+        self.assertNotIn("--log-dir", cmd)
+
+    def test_launch_keep_range_sets_the_env_and_names_each_kept_run_after(
+        self,
+    ) -> None:
+        run_ids: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if (request.method, request.url.path) == ("GET", "/hub/eval/jobs"):
+                run_id = run_ids[0]
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            **KEPT_JOB,
+                            "id": "job-kept",
+                            "clientJobKey": f"inspect_{run_id}-a",
+                        },
+                        # Another launch's kept run is not this launch's to report.
+                        {
+                            **KEPT_JOB,
+                            "id": "job-other",
+                            "clientJobKey": "inspect_other-a",
+                        },
+                        # A run with no trials kept nothing.
+                        {
+                            **KEPT_JOB,
+                            "id": "job-empty",
+                            "clientJobKey": f"inspect_{run_id}-b",
+                            "trialCount": 0,
+                        },
+                    ],
+                )
+            return httpx.Response(404, json={"errorMessage": "not found"})
+
+        code, _, env, stderr = _launch(
+            ["launch", "--model", "mockllm/model", "--keep-range"],
+            on_spawn=lambda _cmd, child_env: run_ids.append(
+                child_env["ROGUE_ARENA_RUN_ID"]
+            ),
+            client_handler=handler,
+        )
+        assert env is not None
+        self.assertEqual(code, 0)
+        self.assertEqual(env["ROGUE_ARENA_KEEP_RANGE"], "true")
+        self.assertIn("rogue-arena-inspect close job-kept", stderr)
+        self.assertNotIn("job-other", stderr)
+        self.assertNotIn("job-empty", stderr)
+        self.assertNotIn(TOKEN, stderr)
+
+    def test_launch_without_keep_range_leaves_the_env_var_unset(self) -> None:
+        _, _, env, stderr = _launch(["launch", "--model", "mockllm/model"])
+        assert env is not None
+        self.assertNotIn("ROGUE_ARENA_KEEP_RANGE", env)
+        self.assertNotIn("--keep-range", stderr)
+
     def test_launch_passes_extra_args_through_to_inspect(self) -> None:
         code, cmd, _, _ = _launch(
             ["launch", "--model", "m", "--eval", "x", "--", "--limit", "1"]
@@ -1053,6 +1501,720 @@ class CliFailureTests(unittest.TestCase):
         self.assertEqual(run.stdout, "")
         self.assertIn("invalid whoami", run.stderr)
         self.assertNotIn(TOKEN, run.output)
+
+
+def _guide_catalog_hub() -> Handler:
+    """A hub with the guide route and a listing that names the eval."""
+    guide = _guide_hub()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/hub/eval/evals":
+            return httpx.Response(
+                200,
+                json=[{**EVALS[0], "environmentId": GUIDE_ENV_ID, "name": "ad-chain"}],
+            )
+        return guide(request)
+
+    return handler
+
+
+class CliLaunchPromptLevelTests(unittest.TestCase):
+    """`launch --prompt-level` gives the model the eval author's prompt, nothing else."""
+
+    def _launch_at(self, level: str, selector: str = GUIDE_ENV_ID) -> tuple[Any, ...]:
+        return _launch(
+            ["launch", "--model", "m", "--eval", selector, "--prompt-level", level],
+            client_handler=_guide_catalog_hub(),
+        )
+
+    def test_the_prompt_reaches_the_child_and_the_graders_never_do(self) -> None:
+        code, cmd, env, _ = self._launch_at("hard")
+        assert cmd is not None and env is not None
+        self.assertEqual(code, 0)
+        self.assertEqual(env["ROGUE_ARENA_PROMPT"], "win")
+        child_view = " ".join(cmd) + " ".join(env.values())
+        for secret in ("/root/flag1.txt", "web -> app VLAN -> dc", "whoami"):
+            self.assertNotIn(secret, child_view)
+
+    def test_an_eval_name_resolves_to_its_guide(self) -> None:
+        code, _, env, _ = self._launch_at("easy", selector="ad-chain")
+        assert env is not None
+        self.assertEqual(code, 0)
+        self.assertEqual(env["ROGUE_ARENA_PROMPT"], "do the easy thing")
+
+    def test_a_blank_prompt_stops_before_the_child_starts(self) -> None:
+        code, cmd, _, stderr = self._launch_at("medium")
+        self.assertEqual(code, 1)
+        self.assertIsNone(cmd)
+        self.assertIn("no medium recommended prompt", stderr)
+
+    def test_it_needs_an_eval_to_read_the_prompt_from(self) -> None:
+        code, cmd, _, stderr = _launch(
+            ["launch", "--model", "m", "--prompt-level", "hard"],
+            client_handler=_guide_catalog_hub(),
+        )
+        self.assertEqual(code, 1)
+        self.assertIsNone(cmd)
+        self.assertIn("--prompt-level needs an eval", stderr)
+
+    def test_without_the_flag_no_prompt_is_set(self) -> None:
+        _, _, env, _ = _launch(["launch", "--model", "m", "--eval", "x"])
+        assert env is not None
+        self.assertNotIn("ROGUE_ARENA_PROMPT", env)
+
+
+class ExampleTaskPromptTests(unittest.TestCase):
+    """The built-in tasks use the prompt `launch` chose, and their own without one."""
+
+    def _load(self, name: str) -> ModuleType:
+        spec = importlib.util.spec_from_file_location(
+            f"_example_{name}", EXAMPLES_DIR / f"{name}.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_solo_task_uses_the_chosen_prompt(self) -> None:
+        task = self._load("eval_example").rogue_arena_eval
+        with patch.dict(os.environ, {"ROGUE_ARENA_PROMPT": "the author's"}):
+            self.assertEqual(task().dataset[0].input, "the author's")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIn("WIN CONDITION", task().dataset[0].input)
+
+    def test_the_team_task_uses_the_chosen_prompt(self) -> None:
+        task = self._load("team_example").rogue_arena_team
+        team = {"ROGUE_ARENA_TEAM": str(EXAMPLES_DIR / "team.yaml")}
+        with patch.dict(os.environ, {**team, "ROGUE_ARENA_PROMPT": "the author's"}):
+            self.assertEqual(task().dataset[0].input, "the author's")
+        with patch.dict(os.environ, team, clear=True):
+            self.assertIn("WIN CONDITION", task().dataset[0].input)
+
+
+class CliShareTranscriptTests(unittest.TestCase):
+    """`launch --share-transcript` uploads the finished run's .eval."""
+
+    JOB_ID = "33333333-3333-4333-8333-333333333333"
+    LOG_NAME = "2026-11-05T00-00-00_task_abc.eval"
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.log_dir = Path(directory.name)
+        self.run_id: str | None = None
+        self.uploads: list[dict[str, object]] = []
+        # Only a log the test tagged belongs to this launch; any other .eval
+        # in the folder stands for another run's.
+        self.own_logs = {self.LOG_NAME}
+        self.log_models: dict[str, str] = {}
+        self.log_statuses: dict[str, str] = {}
+        patcher = patch(
+            "inspect_rogue_arena.cli._log_facts",
+            lambda path: _LogFacts(
+                self.run_id if path.name in self.own_logs else "someone-else",
+                self.log_models.get(path.name),
+                self.log_statuses.get(path.name, "success"),
+            ),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _hub(
+        self, jobs: int = 1, models: Sequence[str | None] = (), empty_jobs: int = 0
+    ) -> Handler:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if (request.method, request.url.path) == ("GET", "/hub/eval/jobs"):
+                other = {**JOBS[0], "id": "other", "clientJobKey": "inspect_other"}
+                own = [
+                    {
+                        **JOBS[0],
+                        "id": self.JOB_ID if index == 0 else f"job-{index}",
+                        "status": "cancelled",
+                        "clientJobKey": f"inspect_{self.run_id}-{index}",
+                        "model": models[index] if index < len(models) else None,
+                    }
+                    for index in range(jobs)
+                ]
+                empty = [
+                    {
+                        **JOBS[0],
+                        "id": f"empty-{index}",
+                        "status": "cancelled",
+                        "trialCount": 0,
+                        "closedTrialCount": 0,
+                        "clientJobKey": f"inspect_{self.run_id}-empty{index}",
+                    }
+                    for index in range(empty_jobs)
+                ]
+                return httpx.Response(200, json=[other, *own, *empty])
+            if request.method == "PUT" and request.url.path.endswith("/transcript"):
+                data = request.content
+                self.uploads.append(
+                    {
+                        "path": request.url.path,
+                        "headers": dict(request.headers),
+                        "size": len(data),
+                    }
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "transcript": {
+                            "id": "t-9",
+                            "jobId": self.JOB_ID,
+                            "status": "ready",
+                            "byteLength": len(data),
+                            "sha256": request.headers["x-eval-transcript-sha256"],
+                            "fileName": request.headers.get(
+                                "x-eval-transcript-file-name"
+                            ),
+                            "uploadedAt": "2026-11-05T00:00:00.000Z",
+                            "readyAt": "2026-11-05T00:00:01.000Z",
+                            "expiresAt": "2026-12-05T00:00:00.000Z",
+                        },
+                        "replayed": False,
+                    },
+                )
+            return httpx.Response(404, json={"errorMessage": "nope"})
+
+        return handler
+
+    def _on_spawn(
+        self, *names: str, contents: bytes = b"EVAL-BYTES"
+    ) -> Callable[[list[str], dict[str, str]], None]:
+        def on_spawn(cmd: list[str], env: dict[str, str]) -> None:
+            self.run_id = env["ROGUE_ARENA_RUN_ID"]
+            for name in names:
+                (self.log_dir / name).write_bytes(contents)
+
+        return on_spawn
+
+    def _argv(self) -> list[str]:
+        return [
+            "launch",
+            "--model",
+            "m",
+            "--eval",
+            "x",
+            "--share-transcript",
+            "--",
+            "--log-dir",
+            str(self.log_dir),
+        ]
+
+    def test_launch_uploads_the_runs_eval_and_keeps_the_local_log(self) -> None:
+        code, cmd, env, stderr = _launch(
+            self._argv(),
+            on_spawn=self._on_spawn(self.LOG_NAME),
+            client_handler=self._hub(),
+        )
+        assert cmd is not None and env is not None
+        self.assertEqual(code, 0)
+        # the child is tagged with the run id, in its env and in the log's metadata
+        self.assertEqual(env["ROGUE_ARENA_RUN_ID"], self.run_id)
+        self.assertEqual(
+            cmd[cmd.index("--metadata") + 1], f"rogue_arena_run_id={self.run_id}"
+        )
+        self.assertEqual(len(self.uploads), 1)
+        upload = self.uploads[0]
+        self.assertEqual(upload["path"], f"/hub/eval/jobs/{self.JOB_ID}/transcript")
+        self.assertEqual(upload["size"], len(b"EVAL-BYTES"))
+        headers = upload["headers"]
+        assert isinstance(headers, dict)
+        self.assertEqual(headers["content-type"], "application/octet-stream")
+        self.assertEqual(
+            headers["x-eval-transcript-sha256"],
+            hashlib.sha256(b"EVAL-BYTES").hexdigest(),
+        )
+        self.assertEqual(uuid.UUID(headers["idempotency-key"]).version, 4)
+        self.assertEqual(headers["x-eval-transcript-file-name"], self.LOG_NAME)
+        self.assertIn("shared transcript t-9", stderr)
+        # the user's own log is still where Inspect wrote it
+        self.assertEqual((self.log_dir / self.LOG_NAME).read_bytes(), b"EVAL-BYTES")
+
+    def test_launch_leaves_the_log_dir_to_inspect(self) -> None:
+        argv = ["launch", "--model", "m", "--eval", "x", "--share-transcript"]
+        with tempfile.TemporaryDirectory() as cwd:
+            previous = Path.cwd()
+            os.chdir(cwd)
+            try:
+                code, cmd, _, stderr = _launch(argv)
+            finally:
+                os.chdir(previous)
+        assert cmd is not None
+        self.assertEqual(code, 0)
+        self.assertNotIn("--log-dir", cmd)
+        self.assertIn("found 0", stderr)
+
+    def test_inspect_log_dir_env_is_where_it_looks(self) -> None:
+        code, _, _, _ = _launch(
+            ["launch", "--model", "m", "--eval", "x", "--share-transcript"],
+            env={**ENV, "INSPECT_LOG_DIR": str(self.log_dir)},
+            on_spawn=self._on_spawn(self.LOG_NAME),
+            client_handler=self._hub(),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.uploads), 1)
+
+    def test_another_runs_log_in_the_same_folder_is_never_uploaded(self) -> None:
+        code, _, _, _ = _launch(
+            self._argv(),
+            on_spawn=self._on_spawn(self.LOG_NAME, "2026-11-05T00-00-01_other.eval"),
+            client_handler=self._hub(),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.uploads), 1)
+        headers = self.uploads[0]["headers"]
+        assert isinstance(headers, dict)
+        self.assertEqual(headers["x-eval-transcript-file-name"], self.LOG_NAME)
+
+    def test_an_older_log_is_not_read_as_this_runs(self) -> None:
+        stale = self.log_dir / self.LOG_NAME
+        stale.write_bytes(b"OLD")
+        os.utime(stale, (1_000_000_000, 1_000_000_000))
+        code, _, _, stderr = _launch(
+            self._argv(),
+            on_spawn=self._on_spawn(),
+            client_handler=self._hub(),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.uploads, [])
+        self.assertIn("found 0", stderr)
+
+    def test_a_failed_run_shares_nothing(self) -> None:
+        code, _, _, stderr = _launch(
+            self._argv(),
+            returncode=2,
+            on_spawn=self._on_spawn(self.LOG_NAME),
+            client_handler=self._hub(),
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(self.uploads, [])
+        self.assertIn("no transcript was shared", stderr)
+
+    def test_no_eval_file_skips_the_upload_without_failing(self) -> None:
+        code, _, _, stderr = _launch(
+            self._argv(), on_spawn=self._on_spawn(), client_handler=self._hub()
+        )
+        self.assertEqual(code, 0)  # the eval still succeeded
+        self.assertEqual(self.uploads, [])
+        self.assertIn("found 0", stderr)
+
+    def test_a_remote_log_dir_is_reported_not_read(self) -> None:
+        code, _, _, stderr = _launch(
+            [*self._argv()[:-1], "s3://bucket/logs"],
+            on_spawn=lambda cmd, env: None,
+            client_handler=self._hub(),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.uploads, [])
+        self.assertIn("local log folder", stderr)
+
+    def test_a_multi_model_run_says_how_to_upload_each_log_to_its_run(self) -> None:
+        other_log = "2026-11-05T00-00-01_task_def.eval"
+        self.own_logs.add(other_log)
+        self.log_models = {self.LOG_NAME: "mockllm/a", other_log: "mockllm/b"}
+        code, _, _, stderr = _launch(
+            self._argv(),
+            on_spawn=self._on_spawn(self.LOG_NAME, other_log),
+            client_handler=self._hub(jobs=2, models=["mockllm/a", "mockllm/b"]),
+        )
+        self.assertEqual(code, 0)  # the eval still succeeded
+        self.assertEqual(self.uploads, [])
+        self.assertIn("2 jobs", stderr)
+        # each log is paired with the run of its own model
+        for name, job in ((self.LOG_NAME, self.JOB_ID), (other_log, "job-1")):
+            self.assertIn(
+                f"share-transcript {self.log_dir / name} --run {job}",
+                stderr,
+            )
+
+    def test_a_task_that_errored_shares_nothing_and_says_so(self) -> None:
+        # Inspect can exit 0 when one task of a multi-model run errored, so the exit
+        # code doesn't say which logs finished: each log's own status does.
+        other_log = "2026-11-05T00-00-01_task_def.eval"
+        self.own_logs.add(other_log)
+        self.log_models = {self.LOG_NAME: "mockllm/a", other_log: "mockllm/b"}
+        self.log_statuses = {other_log: "error"}
+        code, _, _, stderr = _launch(
+            self._argv(),
+            on_spawn=self._on_spawn(self.LOG_NAME, other_log),
+            client_handler=self._hub(jobs=1, models=["mockllm/a"]),
+        )
+        self.assertEqual(code, 0)
+        # the finished log still goes up, to its own run
+        self.assertEqual(len(self.uploads), 1)
+        headers = self.uploads[0]["headers"]
+        assert isinstance(headers, dict)
+        self.assertEqual(headers["x-eval-transcript-file-name"], self.LOG_NAME)
+        self.assertIn(f"not sharing {other_log}", stderr)
+        self.assertIn("error", stderr)
+
+    def test_only_unfinished_logs_upload_nothing(self) -> None:
+        self.log_statuses = {self.LOG_NAME: "cancelled"}
+        code, _, _, stderr = _launch(
+            self._argv(),
+            on_spawn=self._on_spawn(self.LOG_NAME),
+            client_handler=self._hub(),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.uploads, [])
+        self.assertIn(f"not sharing {self.LOG_NAME}", stderr)
+        self.assertNotIn("found 0", stderr)
+
+    def test_the_report_never_pairs_a_log_with_another_models_run(self) -> None:
+        # One job left, but it is another model's: it must not be offered.
+        other_log = "2026-11-05T00-00-01_task_def.eval"
+        self.own_logs.add(other_log)
+        self.log_models = {self.LOG_NAME: "mockllm/a", other_log: "mockllm/b"}
+        code, _, _, stderr = _launch(
+            self._argv(),
+            on_spawn=self._on_spawn(self.LOG_NAME, other_log),
+            client_handler=self._hub(jobs=1, models=["mockllm/a"]),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.uploads, [])
+        self.assertIn(
+            f"share-transcript {self.log_dir / self.LOG_NAME} --run {self.JOB_ID}",
+            stderr,
+        )
+        self.assertIn(
+            f"share-transcript {self.log_dir / other_log} --run <run>", stderr
+        )
+
+    def test_a_log_that_matches_no_job_names_the_runs_to_choose_from(self) -> None:
+        other_log = "2026-11-05T00-00-01_task_def.eval"
+        self.own_logs.add(other_log)
+        code, _, _, stderr = _launch(
+            self._argv(),
+            on_spawn=self._on_spawn(self.LOG_NAME, other_log),
+            client_handler=self._hub(jobs=2, models=["mockllm/a", "mockllm/b"]),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.uploads, [])
+        self.assertIn(
+            f"share-transcript {self.log_dir / self.LOG_NAME} --run <run>", stderr
+        )
+        self.assertIn(f"{self.JOB_ID} (mockllm/a)", stderr)
+        self.assertIn("job-1 (mockllm/b)", stderr)
+
+    def test_an_empty_job_is_not_one_of_the_runs_jobs(self) -> None:
+        # e.g. a task with its own model: Inspect's startup ran under the --model.
+        code, _, _, _ = _launch(
+            self._argv(),
+            on_spawn=self._on_spawn(self.LOG_NAME),
+            client_handler=self._hub(jobs=1, empty_jobs=1),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.uploads), 1)
+        self.assertEqual(
+            self.uploads[0]["path"], f"/hub/eval/jobs/{self.JOB_ID}/transcript"
+        )
+
+    def test_a_missing_run_list_endpoint_is_reported_not_fatal(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"errorMessage": "nope"})
+
+        code, _, _, stderr = _launch(
+            self._argv(),
+            on_spawn=self._on_spawn(self.LOG_NAME),
+            client_handler=handler,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("could not share the transcript", stderr)
+        self.assertNotIn(TOKEN, stderr)
+
+
+class CliShareTranscriptCommandTests(unittest.TestCase):
+    """`share-transcript FILE` uploads an existing .eval, e.g. after a failed upload."""
+
+    JOB_ID = "33333333-3333-4333-8333-333333333333"
+    RUN_ID = "44444444-4444-4444-8444-444444444444"
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "2026-11-05T00-00-00_task_abc.eval"
+        self.path.write_bytes(b"EVAL-BYTES")
+        self.tag: str | None = self.RUN_ID
+        self.log_model: str | None = None
+        self.uploads: list[httpx.Request] = []
+        self.replayed = False
+        patcher = patch(
+            "inspect_rogue_arena.cli._log_facts",
+            lambda path: _LogFacts(self.tag, self.log_model, "success"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _job(self, key: str | None = None) -> dict[str, object]:
+        return {
+            **JOBS[0],
+            "id": self.JOB_ID,
+            "status": "cancelled",
+            "clientJobKey": f"inspect_{self.RUN_ID}-abc" if key is None else key,
+        }
+
+    def _hub(self, *, job_key: str | None = None) -> Handler:
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if (request.method, path) == ("GET", "/hub/eval/jobs"):
+                return httpx.Response(200, json=[self._job(job_key)])
+            if (request.method, path) == ("GET", f"/hub/eval/jobs/{self.JOB_ID}"):
+                return httpx.Response(200, json=self._job(job_key))
+            if request.method == "PUT" and path.endswith("/transcript"):
+                self.uploads.append(request)
+                return httpx.Response(
+                    200,
+                    json={
+                        "transcript": {
+                            "id": "t-9",
+                            "jobId": self.JOB_ID,
+                            "status": "ready",
+                            "byteLength": len(request.content),
+                            "sha256": request.headers["x-eval-transcript-sha256"],
+                            "fileName": None,
+                            "uploadedAt": "2026-11-05T00:00:00.000Z",
+                            "readyAt": "2026-11-05T00:00:01.000Z",
+                            "expiresAt": "2026-12-05T00:00:00.000Z",
+                        },
+                        "replayed": self.replayed,
+                    },
+                )
+            return httpx.Response(404, json={"errorMessage": "nope"})
+
+        return handler
+
+    def test_a_tagged_log_finds_its_own_run(self) -> None:
+        run = _run(["share-transcript", str(self.path)], self._hub())
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertEqual(len(self.uploads), 1)
+        self.assertEqual(
+            self.uploads[0].url.path, f"/hub/eval/jobs/{self.JOB_ID}/transcript"
+        )
+        self.assertIn("shared transcript t-9", run.stdout)
+        self.assertNotIn(TOKEN, run.stdout + run.stderr)
+
+    def test_a_retry_uses_the_same_key_as_the_failed_upload(self) -> None:
+        run = _run(["share-transcript", str(self.path)], self._hub())
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertEqual(
+            self.uploads[0].headers["idempotency-key"],
+            transcript_upload_key(
+                self.JOB_ID, hashlib.sha256(b"EVAL-BYTES").hexdigest()
+            ),
+        )
+
+    def test_a_replay_says_it_was_already_shared(self) -> None:
+        self.replayed = True
+        run = _run(["share-transcript", str(self.path)], self._hub())
+        self.assertEqual(run.code, 0)
+        self.assertIn("already shared", run.stdout)
+
+    def test_new_upload_sends_a_fresh_key(self) -> None:
+        run = _run(["share-transcript", str(self.path), "--new-upload"], self._hub())
+        self.assertEqual(run.code, 0, run.stderr)
+        key = self.uploads[0].headers["idempotency-key"]
+        self.assertEqual(uuid.UUID(key).version, 4)
+        self.assertNotEqual(
+            key,
+            transcript_upload_key(
+                self.JOB_ID, hashlib.sha256(b"EVAL-BYTES").hexdigest()
+            ),
+        )
+
+    def test_an_untagged_log_needs_the_run_named(self) -> None:
+        self.tag = None
+        run = _run(["share-transcript", str(self.path)], self._hub())
+        self.assertEqual(run.code, 1)
+        self.assertIn("--run", run.stderr)
+        self.assertEqual(self.uploads, [])
+
+    def test_an_untagged_log_goes_to_the_named_run(self) -> None:
+        self.tag = None
+        run = _run(
+            ["share-transcript", str(self.path), "--run", self.JOB_ID], self._hub()
+        )
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertEqual(len(self.uploads), 1)
+
+    def test_a_tagged_log_is_refused_for_another_run(self) -> None:
+        run = _run(
+            ["share-transcript", str(self.path), "--run", self.JOB_ID],
+            self._hub(job_key="inspect_someone-else-abc"),
+        )
+        self.assertEqual(run.code, 1)
+        self.assertIn("belongs to a different run", run.stderr)
+        self.assertEqual(self.uploads, [])
+
+    def _two_jobs_hub(self) -> Handler:
+        jobs = [
+            {**self._job(), "model": "mockllm/a"},
+            {
+                **self._job(f"inspect_{self.RUN_ID}-def"),
+                "id": "job-b",
+                "model": "mockllm/b",
+            },
+        ]
+        base = self._hub()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if (request.method, request.url.path) == ("GET", "/hub/eval/jobs"):
+                return httpx.Response(200, json=jobs)
+            if (request.method, request.url.path) == ("GET", "/hub/eval/jobs/job-b"):
+                return httpx.Response(200, json=jobs[1])
+            return base(request)
+
+        return handler
+
+    def test_a_multi_model_log_finds_the_run_of_its_own_model(self) -> None:
+        self.log_model = "mockllm/b"
+        run = _run(["share-transcript", str(self.path)], self._two_jobs_hub())
+        self.assertEqual(run.code, 0, run.stderr)
+        self.assertEqual(self.uploads[0].url.path, "/hub/eval/jobs/job-b/transcript")
+
+    def test_a_log_is_refused_for_another_models_run(self) -> None:
+        self.log_model = "mockllm/a"
+        run = _run(
+            ["share-transcript", str(self.path), "--run", "job-b"],
+            self._two_jobs_hub(),
+        )
+        self.assertEqual(run.code, 1)
+        self.assertIn("belongs to a different run", run.stderr)
+        self.assertEqual(self.uploads, [])
+
+    def test_a_tagged_log_is_not_sent_to_a_lone_job_of_another_model(self) -> None:
+        self.log_model = "mockllm/b"
+        job = {**self._job(), "model": "mockllm/a"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if (request.method, request.url.path) == ("GET", "/hub/eval/jobs"):
+                return httpx.Response(200, json=[job])
+            return self._hub()(request)
+
+        run = _run(["share-transcript", str(self.path)], handler)
+        self.assertEqual(run.code, 1)
+        self.assertIn("--run", run.stderr)
+        self.assertEqual(self.uploads, [])
+
+    def test_a_log_that_cannot_choose_between_runs_names_them(self) -> None:
+        run = _run(["share-transcript", str(self.path)], self._two_jobs_hub())
+        self.assertEqual(run.code, 1)
+        self.assertIn("--run", run.stderr)
+        self.assertIn("job-b (mockllm/b)", run.stderr)
+        self.assertEqual(self.uploads, [])
+
+    def test_a_missing_file_is_a_clear_error(self) -> None:
+        run = _run(["share-transcript", str(self.path) + ".missing"], self._hub())
+        self.assertEqual(run.code, 1)
+        self.assertIn("not found", run.stderr)
+        self.assertEqual(run.requests, ())
+
+    def test_a_refused_upload_exits_nonzero_with_the_hubs_reason(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "PUT":
+                return httpx.Response(
+                    409,
+                    json={
+                        "errorMessage": "already has a transcript",
+                        "errorSeverity": 5,
+                    },
+                )
+            return self._hub()(request)
+
+        run = _run(["share-transcript", str(self.path)], handler)
+        self.assertEqual(run.code, 1)
+        self.assertIn("already has a transcript", run.stderr)
+
+    def test_the_launch_failure_message_points_at_the_command(self) -> None:
+        patcher = patch(
+            "inspect_rogue_arena.cli._logs_of_run",
+            lambda *args: [(self.path, _LogFacts(self.RUN_ID, None, "success"))],
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, json={"errorMessage": "boom"})
+
+        code, _, _, stderr = _launch(
+            ["launch", "--model", "m", "--eval", "x", "--share-transcript"],
+            client_handler=handler,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn(f"share-transcript {self.path}", stderr)
+
+
+class LogRunIdTests(unittest.TestCase):
+    """The run id `launch` tags a run with is the one it reads back from the log."""
+
+    def test_a_real_eval_log_carries_the_run_metadata(self) -> None:
+        from inspect_ai import Task
+        from inspect_ai import eval as inspect_eval
+        from inspect_ai.dataset import Sample
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            inspect_eval(
+                Task(dataset=[Sample(input="q")]),
+                model="mockllm/model",
+                metadata={"rogue_arena_run_id": "run-42"},
+                log_dir=log_dir,
+                display="none",
+            )
+            inspect_eval(
+                Task(dataset=[Sample(input="q")]),
+                model="mockllm/model",
+                log_dir=log_dir,
+                display="none",
+            )
+            found = sorted(
+                (str(facts.run_id), str(facts.model), str(facts.status))
+                for facts in map(_log_facts, Path(log_dir).glob("*.eval"))
+            )
+
+        self.assertEqual(
+            found,
+            [
+                ("None", "mockllm/model", "success"),
+                ("run-42", "mockllm/model", "success"),
+            ],
+        )
+
+    def test_an_unreadable_log_has_no_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as log_dir:
+            path = Path(log_dir) / "broken.eval"
+            path.write_bytes(b"not a log")
+            self.assertEqual(_log_facts(path), _LogFacts(None, None, None))
+
+
+class CliRunModelLabelTests(unittest.TestCase):
+    """A run shows the model it evaluated, when it has one."""
+
+    def _jobs_hub(self, model: str | None) -> Handler:
+        job = {**JOBS[0], "model": model}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/hub/eval/jobs":
+                return httpx.Response(200, json=[job])
+            if request.url.path == "/hub/eval/jobs/job-1":
+                return httpx.Response(200, json=job)
+            if request.url.path == "/hub/eval/jobs/job-1/trials":
+                return httpx.Response(200, json=[])
+            return httpx.Response(404, json={"errorMessage": "nope"})
+
+        return handler
+
+    def test_runs_and_run_show_the_model(self) -> None:
+        for argv in (["runs"], ["run", "job-1"]):
+            with self.subTest(argv=argv):
+                run = _run(argv, self._jobs_hub("openai/gpt-4o"))
+                self.assertEqual(run.code, 0, run.stderr)
+                self.assertIn("model openai/gpt-4o", run.stdout)
+
+    def test_a_run_with_no_model_omits_it(self) -> None:
+        run = _run(["runs"], self._jobs_hub(None))
+        self.assertEqual(run.code, 0)
+        self.assertNotIn("model", run.stdout)
 
 
 class LaunchParallelInspectRunTests(unittest.TestCase):

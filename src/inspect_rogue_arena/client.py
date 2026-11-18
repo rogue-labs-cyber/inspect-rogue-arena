@@ -8,15 +8,19 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import anyio
 import httpx
+
+from inspect_rogue_arena.preseed import Preseed
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,6 +28,24 @@ _LOGGER = logging.getLogger(__name__)
 # it always reaches Rogue Arena (it is never resent), bounded by the
 # close request's own timeout so it cannot hold a cancellation open forever.
 _CLOSE_REQUEST_SECONDS = 60
+
+# The hub's limit on a job's model label.
+_JOB_MODEL_MAX_CHARS = 200
+# The largest .eval a run may share: the largest body Rogue Arena accepts
+# (100 MB, decimal), so a file the client admits never comes back as a 413.
+EVAL_TRANSCRIPT_MAX_BYTES = 100_000_000
+# The transcript file-name header's rule, from the hub's contract.
+_TRANSCRIPT_NAME_CHARS = re.compile(r"[^A-Za-z0-9._+-]")
+_TRANSCRIPT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\.eval")
+_TRANSCRIPT_NAME_MAX = 255
+# A transcript upload's own request timeout: long enough for a slow link to finish
+# a 100 MB upload, so it ends with the hub's answer, not the client giving up.
+_TRANSCRIPT_REQUEST_SECONDS = 32 * 60
+# How long share_transcript keeps retrying after its first retryable failure:
+# longer than the hub's 90 s wait for a lost upload to be taken over.
+_TRANSCRIPT_RETRY_DEADLINE_SECONDS = 5 * 60
+_TRANSCRIPT_RETRY_BACKOFF_SECONDS = 2.0
+_TRANSCRIPT_RETRY_BACKOFF_CAP_SECONDS = 30.0
 # The claim POST's own timeout, so a long ready wait never lets one hung request
 # block for its whole length (900 s was the claim's bound before the wait grew).
 _CLAIM_REQUEST_SECONDS = 900.0
@@ -62,6 +84,9 @@ class EvalTrialTerminalReason(str, Enum):
     HALTED = "halted"
     # A server terminal reason; accepted so parsing never fails on it.
     TEAM_MEMBER = "team_member"
+    # A preseed step failed, timed out or could not run: unscored, the model
+    # never started; the step's output is on the trial's events.
+    PRESEED_FAILED = "preseed_failed"
 
 
 class EvalClientKind(str, Enum):
@@ -73,6 +98,21 @@ class EvalClientKind(str, Enum):
 class EvalScoringMode(str, Enum):
     SEQUENTIAL = "sequential"
     INDEPENDENT = "independent"
+
+
+class EvalProofType(str, Enum):
+    """How the hub proves a hop: a planted key file, or a command check."""
+
+    KEY_FILE = "keyFile"
+    COMMAND_CHECK = "commandCheck"
+
+
+class EvalPromptLevel(str, Enum):
+    """The eval author's recommended prompts, by how much direction they give."""
+
+    EASY = "easy"
+    MEDIUM = "medium"
+    HARD = "hard"
 
 
 class EvalTrialEventKind(str, Enum):
@@ -154,15 +194,30 @@ class RogueArenaApiError(RuntimeError):
         body: Any,
         *,
         secret: str | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         self.status_code = status_code
         self.method = method
         self.path = path
         self.body = body
+        self.headers = MappingProxyType(dict(headers or {}))
         super().__init__(
             f"Rogue Arena API returned {status_code} for {method} {path}: "
             f"{_describe_error_body(status_code, body, secret)}"
         )
+
+    @property
+    def retry_after_seconds(self) -> float | None:
+        """The ``Retry-After`` header as seconds, when the hub sent one (delta
+        seconds only; the hub sends a number). None otherwise."""
+        value = self.headers.get("retry-after") or self.headers.get("Retry-After")
+        if value is None:
+            return None
+        try:
+            seconds = float(value.strip())
+        except ValueError:
+            return None
+        return seconds if seconds >= 0 else None
 
 
 class EvalClaimDenied(RogueArenaApiError):
@@ -185,12 +240,44 @@ class EvalClaimDenied(RogueArenaApiError):
         return self.status_code == 402
 
 
+class EvalGuideNotOffered(RogueArenaApiError):
+    """The server does not serve eval guides to this client.
+
+    The guide request was refused (``status_code``: 401, or a redirect to a
+    sign-in page) while the same token passed ``whoami``, so the token is not
+    the problem: the server, or a gateway in front of it, does not let a token
+    reach the guide route.
+    """
+
+    def __init__(self, refused: RogueArenaApiError) -> None:
+        super().__init__(
+            refused.status_code,
+            refused.method,
+            refused.path,
+            refused.body,
+            headers=refused.headers,
+        )
+        message = (
+            "this Rogue Arena server does not offer eval guides to the client: "
+            f"{refused.method} {refused.path} answered HTTP {refused.status_code}, "
+            "but your token works (whoami accepted it). `eval --guide`, "
+            "`eval --prompt-level` and `launch --prompt-level` cannot run against "
+            "this server"
+        )
+        self.args = (message,)
+
+
+# Guide answers that blame the token or the base URL, which whoami can confirm.
+def _guide_refusal(status_code: int) -> bool:
+    return status_code == 401 or 300 <= status_code < 400
+
+
 class TrialReadyTimeout(TimeoutError):
     """The trial was still provisioning when the client's backstop ran out.
 
-    The hub judges provisioning progress itself and expires a copy that stops
-    progressing (``TrialClosedBeforeReady``), so the client waits while the
-    hub reports the trial provisioning, up to ``max_wait_seconds``.
+    The hub judges build progress itself and ends a build that stalls or runs
+    too long (``TrialClosedBeforeReady``), so the client waits while the hub
+    reports the trial provisioning, up to ``max_wait_seconds``.
     """
 
     def __init__(self, trial_id: str, max_wait_seconds: float) -> None:
@@ -205,9 +292,9 @@ class TrialReadyTimeout(TimeoutError):
 class TrialClosedBeforeReady(RuntimeError):
     """The hub closed the trial while it was provisioning.
 
-    ``reason`` is the hub's own account of why (its last lifecycle event for
-    the trial, e.g. ``expired while provisioning: the copy did not come up
-    within the wall clock``), or ``None`` when it could not be read.
+    ``reason`` is the hub's own account of why, from its lifecycle events at the
+    close (e.g. ``expired while provisioning: the copy disappeared``), or
+    ``None`` when it gave none or they could not be read.
     """
 
     def __init__(self, trial: EvalTrial, reason: str | None = None) -> None:
@@ -222,12 +309,6 @@ class TrialClosedBeforeReady(RuntimeError):
         )
         if reason:
             message += f": {reason}"
-        if _wall_clock_ran_out(trial):
-            message += (
-                "; the trial's wall clock (max_runtime_seconds) ran out before its "
-                "range was ready, and provisioning counts against it, so a large "
-                "scenario needs a higher one"
-            )
         super().__init__(message)
 
 
@@ -247,21 +328,6 @@ def _not_before(value: str | None, start: datetime) -> bool:
         return at is not None and at >= start
     except TypeError:  # one naive, one aware: not comparable, so not known
         return False
-
-
-def _wall_clock_ran_out(trial: EvalTrial) -> bool:
-    """Whether the hub closed the trial at or past its lease (its wall clock).
-
-    A provisioning trial's lease is its claim plus the wall clock; the hub
-    expires a copy that stops progressing earlier than that, and then a
-    longer wall clock would not have helped.
-    """
-    lease = _hub_time(trial.lease_expires_at)
-    return (
-        trial.outcome is EvalTrialOutcome.EXPIRED
-        and lease is not None
-        and _not_before(trial.closed_at, lease)
-    )
 
 
 def _str(value: Any, field: str) -> str:
@@ -342,6 +408,102 @@ class EvalReadiness:
 
 
 @dataclass(frozen=True, slots=True)
+class EvalGuideHop:
+    """One hop's grading config, as the hub scores it. For the person running
+    the eval only: never put it in front of the model under test."""
+
+    step_number: int
+    name: str
+    description: str
+    machine_nickname: str
+    proof_type: EvalProofType
+    # keyFile: where the run plants the key. None for a command check.
+    key_filepath: str | None
+    # commandCheck: the command whose output the regex must match (None when a
+    # check script runs instead, and for a key file).
+    command: str | None
+    regex: str | None
+    # commandCheck: the hidden script run with bash in place of a command.
+    check_script: str | None
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> EvalGuideHop:
+        return cls(
+            step_number=int(value["stepNumber"]),
+            name=_str(value["name"], "hop name"),
+            description=_str(value["description"], "hop description"),
+            machine_nickname=_str(value["machineNickname"], "machineNickname"),
+            proof_type=EvalProofType(_str(value["proofType"], "proofType")),
+            key_filepath=_opt_str(value.get("keyFilepath"), "keyFilepath"),
+            command=_opt_str(value.get("command"), "command"),
+            regex=_opt_str(value.get("regex"), "regex"),
+            check_script=_opt_str(value.get("checkScript"), "checkScript"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EvalGuide:
+    """A published eval's graders, solution writeup and recommended prompts.
+
+    From the version Inspect runs. The graders (``hops``) and the solution are
+    for the person running the eval, never for the model under test; the
+    recommended prompts are written to be given to it. Empty strings where the
+    author wrote none.
+    """
+
+    environment_id: str
+    name: str
+    environment_build_id: str
+    canvas_version_number: int
+    agent_machine_nickname: str | None
+    scoring_mode: EvalScoringMode
+    hops: tuple[EvalGuideHop, ...]
+    solution_writeup: str
+    recommended_prompts: Mapping[EvalPromptLevel, str]
+    raw: Mapping[str, Any]
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> EvalGuide:
+        hops = value["hops"]
+        if not isinstance(hops, list):
+            raise TypeError("Rogue Arena returned an invalid eval guide hops list")
+        prompts = _mapping(value["recommendedPrompts"], "recommendedPrompts")
+        return cls(
+            environment_id=_str(value["environmentId"], "environmentId"),
+            name=_str(value["name"], "name"),
+            environment_build_id=_str(
+                value["environmentBuildId"], "environmentBuildId"
+            ),
+            canvas_version_number=int(value["canvasVersionNumber"]),
+            agent_machine_nickname=_opt_str(
+                value.get("agentMachineNickname"), "agentMachineNickname"
+            ),
+            scoring_mode=EvalScoringMode(_str(value["scoringMode"], "scoringMode")),
+            hops=tuple(
+                EvalGuideHop.from_dict(_mapping(row, "guide hop")) for row in hops
+            ),
+            solution_writeup=_str(value["solutionWriteup"], "solutionWriteup"),
+            recommended_prompts=MappingProxyType(
+                {
+                    level: _str(prompts[level.value], f"{level.value} prompt")
+                    for level in EvalPromptLevel
+                }
+            ),
+            raw=MappingProxyType(dict(value)),
+        )
+
+    def prompt(self, level: EvalPromptLevel) -> str:
+        """The author's recommended prompt at ``level``; raises if none was written."""
+        text = self.recommended_prompts[level].strip()
+        if not text:
+            raise RuntimeError(
+                f"eval {self.name or self.environment_id} has no {level.value} "
+                "recommended prompt (its author wrote none)"
+            )
+        return text
+
+
+@dataclass(frozen=True, slots=True)
 class EvalCatalogEntry:
     environment_id: str
     name: str
@@ -393,10 +555,25 @@ class EvalJob:
     concurrency: int
     wall_clock_limit_seconds: int
     client_job_key: str | None
+    # The model the run evaluates; None when the job has no label.
+    model: str | None
     status: EvalJobStatus
     trial_count: int
     closed_trial_count: int
     raw: Mapping[str, Any]
+    # Keep-range: a trial that ends scored leaves its range up until the run's
+    # range is closed (``close_range``). False on a hub that predates it.
+    keep_range: bool = False
+    # When the run's kept range was closed; None while it is open, or without
+    # keep-range.
+    range_closed_at: str | None = None
+    # How many of the run's ranges are kept open right now: 0 once every kept range
+    # was removed (closed, removed on the web, idle-removed). None from a hub that
+    # predates it.
+    kept_range_count: int | None = None
+    # A trial of the run was claimed with a preseed. False on a hub that
+    # predates preseeding.
+    preseeded: bool = False
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> EvalJob:
@@ -413,10 +590,31 @@ class EvalJob:
             concurrency=int(value["concurrency"]),
             wall_clock_limit_seconds=int(value["wallClockLimitSeconds"]),
             client_job_key=_opt_str(value.get("clientJobKey"), "clientJobKey"),
+            model=_opt_str(value.get("model"), "model"),
             status=EvalJobStatus(_str(value["status"], "job status")),
             trial_count=int(value.get("trialCount", 0)),
             closed_trial_count=int(value.get("closedTrialCount", 0)),
             raw=MappingProxyType(dict(value)),
+            keep_range=bool(value.get("keepRange", False)),
+            range_closed_at=_opt_str(value.get("rangeClosedAt"), "rangeClosedAt"),
+            kept_range_count=(
+                None
+                if value.get("keptRangeCount") is None
+                else int(value["keptRangeCount"])
+            ),
+            preseeded=bool(value.get("preseeded", False)),
+        )
+
+    @property
+    def range_kept_open(self) -> bool:
+        """The run keeps finished ranges up: keep-range, not closed, and a range still up.
+
+        A hub without ``keptRangeCount`` answers by the close alone.
+        """
+        return (
+            self.keep_range
+            and self.range_closed_at is None
+            and (self.kept_range_count is None or self.kept_range_count > 0)
         )
 
 
@@ -511,6 +709,8 @@ class EvalTrial:
     # the wire string: the client only reports it, and a newer hub may add codes.
     infra_reason: str | None
     raw: Mapping[str, Any]
+    # The trial was claimed with a preseed. False on a hub that predates it.
+    preseeded: bool = False
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> EvalTrial:
@@ -565,6 +765,7 @@ class EvalTrial:
             ),
             infra_reason=_opt_str(value.get("infraReason"), "infraReason"),
             raw=MappingProxyType(dict(value)),
+            preseeded=bool(value.get("preseeded", False)),
         )
 
 
@@ -584,6 +785,27 @@ class EvalTrialEvent:
             kind=EvalTrialEventKind(_str(value["kind"], "event kind")),
             summary=_str(value.get("summary", ""), "summary"),
             detail=_opt_str(value.get("detail"), "detail"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EvalMachine:
+    """One machine of an eval a preseed step may target (base and hidden machines left out)."""
+
+    # The machine's stable id: the same in every copy of the eval's version.
+    machine_id: str
+    name: str
+    operating_system: str
+    # The machine the model under test drives.
+    agent: bool
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> EvalMachine:
+        return cls(
+            machine_id=_str(value["machineId"], "machineId"),
+            name=_str(value["name"], "machine name"),
+            operating_system=_str(value["operatingSystem"], "operatingSystem"),
+            agent=bool(value.get("agent", False)),
         )
 
 
@@ -711,6 +933,53 @@ def _is_transient(error: Exception) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class EvalTranscript:
+    """A run's shared transcript, as the token API reports it."""
+
+    id: str
+    job_id: str
+    status: str
+    byte_length: int
+    sha256: str
+    file_name: str | None
+    uploaded_at: str
+    ready_at: str | None
+    expires_at: str | None
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> EvalTranscript:
+        return cls(
+            id=_str(value["id"], "transcript id"),
+            job_id=_str(value["jobId"], "jobId"),
+            status=_str(value["status"], "transcript status"),
+            byte_length=int(value["byteLength"]),
+            sha256=_str(value["sha256"], "sha256"),
+            file_name=_opt_str(value.get("fileName"), "fileName"),
+            uploaded_at=_str(value["uploadedAt"], "uploadedAt"),
+            ready_at=_opt_str(value.get("readyAt"), "readyAt"),
+            expires_at=_opt_str(value.get("expiresAt"), "expiresAt"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EvalTranscriptUpload:
+    """The result of sharing a transcript: the stored transcript, and whether
+    this call replayed an earlier upload of the same idempotency key."""
+
+    transcript: EvalTranscript
+    replayed: bool
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> EvalTranscriptUpload:
+        return cls(
+            transcript=EvalTranscript.from_dict(
+                _mapping(value["transcript"], "transcript")
+            ),
+            replayed=bool(value["replayed"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class EvalExecResult:
     running: bool
     exec_id: str | None
@@ -748,8 +1017,9 @@ def _claim_body(
     inspect_eval_set_id: str | None,
     inspect_task_id: str | None,
     sandbox_name: str,
-) -> dict[str, str | int | bool | None]:
-    body: dict[str, str | int | bool | None] = {
+    preseed: Preseed | None = None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
         "jobId": job_id,
         "clientAttemptKey": client_attempt_key,
         "clientKind": EvalClientKind.INSPECT.value,
@@ -766,11 +1036,117 @@ def _claim_body(
         "harborAttempt": None,
         "sandboxName": sandbox_name,
     }
+    # Sent only when set: a hub that predates preseeding refuses the field.
+    if preseed is not None:
+        body["preseed"] = preseed.to_wire()
     return body
+
+
+# Plain http is allowed only to this machine (a local hub or tunnel): anywhere
+# else the bearer token would cross the network in clear.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def checked_base_url(base_url: str) -> str:
+    """``base_url`` without a trailing slash, if it is safe to send a token to.
+
+    An ``https://`` URL with a host, or ``http://`` to localhost only. Anything
+    else raises ``ValueError`` (naming the scheme and host, never credentials
+    embedded in the URL), so a token is never sent in clear.
+    """
+    cleaned = base_url.strip().rstrip("/")
+    parts = urlsplit(cleaned)
+    scheme, host = parts.scheme.lower(), (parts.hostname or "").lower()
+    if (scheme == "https" and host) or (scheme == "http" and host in _LOOPBACK_HOSTS):
+        return cleaned
+    shown = f"{scheme}://{host}" if scheme or host else "a URL with no scheme"
+    raise ValueError(
+        "the Rogue Arena base URL must be an https:// URL (plain http only to "
+        f"localhost), not {shown}: the token would be sent in clear"
+    )
+
+
+def _job_model(model: str | None) -> str | None:
+    """The hub's job ``model`` label: trimmed, at most 200 characters, else None."""
+    if model is None:
+        return None
+    return model.strip()[:_JOB_MODEL_MAX_CHARS].strip() or None
 
 
 def _looks_like_claim_denial(body: Any) -> bool:
     return isinstance(body, Mapping) and isinstance(body.get("decision"), Mapping)
+
+
+def _transcript_retry_after(error: RogueArenaApiError) -> float | None:
+    """Seconds to wait before retrying a transcript upload, or None if final.
+
+    A still-streaming 409 carries ``Retry-After``; any other 409 (a different
+    transcript, a key reused for another file, a deleted key) is final. A rate
+    limit or an unavailable gateway or store retries after its ``Retry-After``,
+    or on the caller's backoff (0.0) without one. A 400 is final: the hub asks
+    for a new key after an integrity mismatch, and its body cannot tell that
+    from a bad request.
+    """
+    if error.status_code == 409:
+        return error.retry_after_seconds
+    if error.status_code == 429 or error.status_code in _TRANSIENT_STATUSES:
+        return error.retry_after_seconds or 0.0
+    return None
+
+
+def transcript_sha256(data: bytes) -> str:
+    """The lowercase-hex sha256 of ``data`` the upload header carries."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def transcript_upload_key(job_id: str, sha256: str) -> str:
+    """The idempotency key for one file in one run: a v4-shaped UUID the hub accepts.
+
+    Derived, not random, because the hub refuses a new key while the run has a
+    live upload: a retry, even from a new process, must send the same key to
+    resume or replay. A different file or run gets a different key.
+    """
+    digest = hashlib.sha256(f"{job_id}:{sha256}".encode()).digest()
+    return str(uuid.UUID(bytes=digest[:16], version=4))
+
+
+def sanitize_transcript_file_name(name: str | None) -> str | None:
+    """A basename the hub's optional file-name header accepts, or None.
+
+    Keeps the basename, with characters outside ``[A-Za-z0-9._+-]`` as ``-``; it
+    starts with a letter or digit, ends with ``.eval``, and is at most 255
+    characters. Returns None when nothing usable is left, so the header is
+    simply omitted.
+    """
+    if not name:
+        return None
+    base = _TRANSCRIPT_NAME_CHARS.sub("-", os.path.basename(name)).lstrip("._+-")
+    if not base:
+        return None
+    if not base.endswith(".eval"):
+        base = f"{base}.eval"
+    base = base[-_TRANSCRIPT_NAME_MAX:].lstrip("._+-")
+    return base if _TRANSCRIPT_NAME.fullmatch(base) else None
+
+
+# A preseed step's last shell-log line: "preseed step <i>/<n> on <machine> (<shell>): <result>".
+_PRESEED_STEP_PREFIX = "preseed step "
+# The most of a failed step's output an error message carries.
+_PRESEED_OUTPUT_MAX_CHARS = 4_000
+
+
+def preseed_failure_output(events: Sequence[EvalTrialEvent]) -> str | None:
+    """The output (tail) of the trial's last preseed step line: the failed step's.
+
+    None when that step printed nothing or never got a result line, so an
+    earlier passed step's output is never shown as the failed one's.
+    """
+    for event in reversed(events):
+        if event.kind is EvalTrialEventKind.LIFECYCLE and event.summary.startswith(
+            _PRESEED_STEP_PREFIX
+        ):
+            return event.detail[-_PRESEED_OUTPUT_MAX_CHARS:] if event.detail else None
+    return None
 
 
 class RogueArenaClient:
@@ -784,7 +1160,7 @@ class RogueArenaClient:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._base = base_url.rstrip("/")
+        self._base = checked_base_url(base_url)
         self._token = token or None
         self._transport = transport
         self._request_timeout_seconds = request_timeout_seconds
@@ -849,7 +1225,65 @@ class RogueArenaClient:
         )
         if not accepted:
             raise RogueArenaApiError(
-                response.status_code, method, path, body, secret=self._token
+                response.status_code,
+                method,
+                path,
+                body,
+                secret=self._token,
+                headers=dict(response.headers),
+            )
+        return HttpResult(
+            response.status_code, body, MappingProxyType(dict(response.headers))
+        )
+
+    async def send_bytes_result(
+        self,
+        method: str,
+        path: str,
+        *,
+        content: bytes,
+        headers: Mapping[str, str],
+        expected_statuses: Sequence[int],
+        timeout_seconds: float | None = None,
+    ) -> HttpResult:
+        """A raw-bytes request (not JSON), for the transcript upload.
+
+        Sends ``content`` with ``headers`` (the bearer is added), and raises
+        ``RogueArenaApiError`` with the response headers for any status outside
+        ``expected_statuses`` (so a 409's ``Retry-After`` is readable). An explicit
+        ``timeout_seconds`` wins over the client's own, which is sized for JSON
+        requests, not a large upload.
+        """
+        if not path.startswith("/"):
+            raise ValueError("Rogue Arena API paths must begin with '/'")
+        effective = (
+            self._request_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        sent = {"Accept": "application/json", **dict(headers)}
+        if self._token is not None:
+            sent["Authorization"] = f"Bearer {self._token}"
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(effective), transport=self._transport
+        ) as client:
+            response = await client.request(
+                method, f"{self._base}{path}", headers=sent, content=content
+            )
+        body: Any = None
+        if response.content:
+            try:
+                body = response.json()
+            except ValueError:
+                body = response.text
+        if response.status_code not in expected_statuses:
+            raise RogueArenaApiError(
+                response.status_code,
+                method,
+                path,
+                body,
+                secret=self._token,
+                headers=dict(response.headers),
             )
         return HttpResult(
             response.status_code, body, MappingProxyType(dict(response.headers))
@@ -881,14 +1315,57 @@ class RogueArenaClient:
             EvalCatalogEntry.from_dict(_mapping(row, "eval entry")) for row in body
         )
 
-    async def list_runs(self) -> tuple[EvalJob, ...]:
+    async def get_eval_guide(self, environment_id: str) -> EvalGuide:
+        """An eval's graders, solution writeup and recommended prompts.
+
+        ``GET /hub/eval/evals/{environmentId}/guide``; 404 for an eval this
+        token's user cannot run. A 401 or a redirect is checked against
+        ``whoami``: if the token passes there, ``EvalGuideNotOffered`` says the
+        server does not serve guides; otherwise the guide's own error stands.
+        Never hand the graders or the solution to the model under test.
+        """
+        try:
+            body = await self._request(
+                "GET", f"/hub/eval/evals/{quote(environment_id, safe='')}/guide"
+            )
+        except RogueArenaApiError as refused:
+            if not _guide_refusal(refused.status_code):
+                raise
+            try:
+                await self.whoami()
+            except Exception:  # noqa: BLE001 - the token or base URL is at fault
+                raise refused from None
+            raise EvalGuideNotOffered(refused) from refused
+        return EvalGuide.from_dict(_mapping(body, "eval guide"))
+
+    async def list_eval_machines(self, environment_id: str) -> tuple[EvalMachine, ...]:
+        """The machines of an eval a preseed step may target, base machines left out.
+
+        ``GET /hub/eval/evals/{environmentId}/machines``: each machine's name,
+        stable id and operating system. 404 for an eval this token's user
+        cannot run.
+        """
+        body = await self._request(
+            "GET", f"/hub/eval/evals/{quote(environment_id, safe='')}/machines"
+        )
+        if not isinstance(body, list):
+            raise TypeError("Rogue Arena returned an invalid machines list")
+        return tuple(
+            EvalMachine.from_dict(_mapping(row, "eval machine")) for row in body
+        )
+
+    async def list_runs(self, *, limit: int | None = None) -> tuple[EvalJob, ...]:
         """List this token's recent eval runs (jobs).
 
         Calls ``GET /hub/eval/jobs``, a token-scoped list endpoint. If it is
         not available a 404/405 surfaces as a ``RogueArenaApiError`` the CLI
         turns into a clean "not available" note rather than a crash.
         """
-        body = await self._request("GET", "/hub/eval/jobs")
+        body = await self._request(
+            "GET",
+            "/hub/eval/jobs",
+            params=None if limit is None else {"limit": limit},
+        )
         if not isinstance(body, list):
             raise TypeError("Rogue Arena returned an invalid runs list")
         return tuple(EvalJob.from_dict(_mapping(row, "run")) for row in body)
@@ -995,7 +1472,16 @@ class RogueArenaClient:
         wall_clock_limit_seconds: int,
         client_job_key: str | None = None,
         visibility: str | None = None,
+        model: str | None = None,
+        keep_range: bool = False,
     ) -> EvalJob:
+        """Create a job; ``model`` labels it with the model under evaluation.
+
+        ``keep_range`` (opt-in): each trial that ends scored keeps its range up,
+        billed like any lab, until ``close_range`` closes it. It is sent only when
+        True: a hub that predates it refuses the field (400), never silently
+        removing a range the caller asked to keep.
+        """
         body: dict[str, Any] = {
             "environmentId": environment_id,
             "n": n,
@@ -1008,6 +1494,11 @@ class RogueArenaClient:
         # and every non-team run) is omitted, and Rogue Arena stores shared_sight.
         if visibility is not None and visibility != "shared_sight":
             body["visibility"] = visibility
+        job_model = _job_model(model)
+        if job_model is not None:
+            body["model"] = job_model
+        if keep_range:
+            body["keepRange"] = True
         posted = await self._request(
             "POST", "/hub/eval/jobs", json=body, expected_statuses=(200,)
         )
@@ -1023,6 +1514,113 @@ class RogueArenaClient:
             "POST", f"/hub/eval/jobs/{job_id}/cancel", json={}, expected_statuses=(200,)
         )
         return EvalJob.from_dict(_mapping(body, "job"))
+
+    async def close_range(self, job_id: str) -> EvalJob:
+        """Close a keep-range run's kept range: Rogue Arena removes every range the
+        run kept up, and a trial of the run that ends later is removed as usual.
+
+        Idempotent: closing a closed range (or a run without keep-range) returns
+        the run unchanged. Only the run's owner may close it; another user's run
+        reads as not found (404).
+        """
+        body = await self._request(
+            "POST",
+            f"/hub/eval/jobs/{job_id}/close-range",
+            json={},
+            expected_statuses=(200,),
+        )
+        return EvalJob.from_dict(_mapping(body, "job"))
+
+    async def upload_transcript(
+        self,
+        job_id: str,
+        *,
+        data: bytes,
+        idempotency_key: str,
+        sha256: str,
+        file_name: str | None = None,
+    ) -> EvalTranscriptUpload:
+        """One PUT of a run's .eval to ``/hub/eval/jobs/{jobId}/transcript``.
+
+        Carries the length, sha256 and idempotency key the route requires;
+        ``file_name`` (already sanitized) is sent when given. Raises
+        ``RogueArenaApiError`` for any non-200, with the response headers (so
+        ``share_transcript`` can read a 409's ``Retry-After``). Does not retry:
+        ``share_transcript`` owns the retry policy and reuses the key.
+        """
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(data)),
+            "Idempotency-Key": idempotency_key,
+            "X-Eval-Transcript-Sha256": sha256,
+        }
+        if file_name is not None:
+            headers["X-Eval-Transcript-File-Name"] = file_name
+        result = await self.send_bytes_result(
+            "PUT",
+            f"/hub/eval/jobs/{quote(job_id, safe='')}/transcript",
+            content=data,
+            headers=headers,
+            expected_statuses=(200,),
+            timeout_seconds=_TRANSCRIPT_REQUEST_SECONDS,
+        )
+        return EvalTranscriptUpload.from_dict(
+            _mapping(result.body, "transcript upload")
+        )
+
+    async def share_transcript(
+        self,
+        job_id: str,
+        *,
+        data: bytes,
+        file_name: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> EvalTranscriptUpload:
+        """Upload a run's .eval once, retrying only the retryable answers.
+
+        The idempotency key is derived from the run and the file unless one is
+        given, so any retry, even from a new process, replays or resumes. Retries
+        a lost connection and the answers ``_transcript_retry_after`` calls
+        retryable, for up to 5 minutes after the first failure, honouring
+        ``Retry-After``. Every other answer (400, 401, 404, a final 409, 413)
+        raises at once.
+        """
+        if len(data) == 0:
+            raise ValueError("refusing to share an empty transcript")
+        if len(data) > EVAL_TRANSCRIPT_MAX_BYTES:
+            raise ValueError(
+                f"transcript is {len(data)} bytes, over the "
+                f"{EVAL_TRANSCRIPT_MAX_BYTES}-byte cap one run may share"
+            )
+        sha = transcript_sha256(data)
+        key = idempotency_key or transcript_upload_key(job_id, sha)
+        deadline: float | None = None
+        backoff = _TRANSCRIPT_RETRY_BACKOFF_SECONDS
+        while True:
+            try:
+                return await self.upload_transcript(
+                    job_id,
+                    data=data,
+                    idempotency_key=key,
+                    sha256=sha,
+                    file_name=file_name,
+                )
+            except (httpx.TransportError, RogueArenaApiError) as error:
+                retry_after = (
+                    _transcript_retry_after(error)
+                    if isinstance(error, RogueArenaApiError)
+                    else 0.0
+                )
+                now = self._monotonic()
+                if deadline is None:
+                    deadline = now + _TRANSCRIPT_RETRY_DEADLINE_SECONDS
+                if retry_after is None or now >= deadline:
+                    raise
+                if retry_after > 0:
+                    await self._sleep(retry_after)
+                else:
+                    await self._sleep(backoff)
+                    backoff = min(backoff * 2, _TRANSCRIPT_RETRY_BACKOFF_CAP_SECONDS)
 
     # --- trials -------------------------------------------------------------
 
@@ -1041,6 +1639,7 @@ class RogueArenaClient:
         sandbox_name: str,
         max_wait_seconds: float,
         poll_interval_seconds: float,
+        preseed: Preseed | None = None,
     ) -> EvalTrial:
         body = _claim_body(
             job_id,
@@ -1053,6 +1652,7 @@ class RogueArenaClient:
             inspect_eval_set_id=inspect_eval_set_id,
             inspect_task_id=inspect_task_id,
             sandbox_name=sandbox_name,
+            preseed=preseed,
         )
         started = self._monotonic()
         try:
@@ -1198,8 +1798,8 @@ class RogueArenaClient:
         """Why the hub closed a trial, from its lifecycle events; best effort.
 
         The hub records why it ended a provisioning trial (the copy stopped
-        progressing, the wall clock ran out, an isolation audit failed) as a
-        lifecycle event in the close, then a closing summary (``closed:
+        progressing, ran too long, or failed an isolation audit) as a lifecycle
+        event in the close, then a closing summary (``closed:
         <outcome> (<reasons>), ...``) that repeats the trial's coded fields.
         So the reason is the close's lifecycle events (those at or after
         ``closedAt``) without the last one. None when the hub gave none.
@@ -1224,7 +1824,12 @@ class RogueArenaClient:
             if event.kind is EvalTrialEventKind.LIFECYCLE
             and _not_before(event.at, closed_at)
         ]
-        return "; ".join(at_close[:-1]) or None
+        reason = "; ".join(at_close[:-1]) or None
+        if trial.terminal_reason is EvalTrialTerminalReason.PRESEED_FAILED:
+            output = preseed_failure_output(events)
+            if output:
+                reason = f"{reason or 'preseed failed'}\n--- the step's output (tail) ---\n{output}"
+        return reason
 
     async def get_trial(
         self, trial_id: str, *, timeout_seconds: float | None = None

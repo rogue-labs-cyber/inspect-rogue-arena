@@ -23,6 +23,7 @@ import os
 from inspect_ai import Task, task
 from inspect_ai.dataset import Sample
 
+from inspect_rogue_arena.config import task_prompt
 from inspect_rogue_arena.scorer import rogue_arena_scorers
 from inspect_rogue_arena.team import load_team_config, team_solver
 
@@ -53,7 +54,12 @@ def rogue_arena_team(report: str | None = None) -> Task:
         )
     config = load_team_config(team_path)
     return Task(
-        dataset=[Sample(input=TEAM_OBJECTIVE, target="scored by Rogue Arena on close")],
+        dataset=[
+            Sample(
+                input=task_prompt(TEAM_OBJECTIVE),
+                target="scored by Rogue Arena on close",
+            )
+        ],
         solver=team_solver(config),
         scorer=rogue_arena_scorers(report),
         sandbox="rogue-arena",

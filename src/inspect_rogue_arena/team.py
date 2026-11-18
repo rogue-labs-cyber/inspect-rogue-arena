@@ -219,7 +219,7 @@ def load_team_config(path: str | Path) -> TeamConfig:
     try:
         raw = json.loads(text)
     except json.JSONDecodeError:
-        import yaml  # inspect_ai pulls PyYAML in transitively (it reads YAML configs)
+        import yaml  # a declared dependency (pyyaml>=6)
 
         raw = yaml.safe_load(text)
     if not isinstance(raw, dict):

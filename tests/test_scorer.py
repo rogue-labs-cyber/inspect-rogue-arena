@@ -1011,6 +1011,7 @@ class PackageExportTests(unittest.TestCase):
     PUBLIC_SURFACE: ClassVar[dict[str, ModuleType]] = {
         # config
         "RogueArenaSandboxConfig": config_module,
+        "task_prompt": config_module,
         # client enums
         "EvalJobStatus": client_module,
         "EvalTrialStatus": client_module,
@@ -1018,6 +1019,8 @@ class PackageExportTests(unittest.TestCase):
         "EvalTrialTerminalReason": client_module,
         "EvalClientKind": client_module,
         "EvalScoringMode": client_module,
+        "EvalProofType": client_module,
+        "EvalPromptLevel": client_module,
         "EvalTrialEventKind": client_module,
         # client types
         "EvalWhoami": client_module,
@@ -1031,7 +1034,12 @@ class PackageExportTests(unittest.TestCase):
         "EvalScoreStep": client_module,
         "EvalHopResult": client_module,
         "EvalExecResult": client_module,
+        "EvalGuide": client_module,
+        "EvalGuideHop": client_module,
+        "EvalGuideNotOffered": client_module,
         "EvalTrialEvent": client_module,
+        "EvalTranscript": client_module,
+        "EvalTranscriptUpload": client_module,
         "TrialClaimDenied": client_module,
         "RogueArenaClient": client_module,
         # client errors
@@ -1070,6 +1078,9 @@ class PackageExportTests(unittest.TestCase):
         "read_scoreboard": team_module,
         "summarize_activity": team_module,
         # shared bash tool
+        "sanitize_transcript_file_name": client_module,
+        "transcript_sha256": client_module,
+        "transcript_upload_key": client_module,
         "rogue_bash": tools_module,
         "DEFAULT_BASH_TIMEOUT_SECONDS": tools_module,
     }

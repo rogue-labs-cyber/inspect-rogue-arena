@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -13,6 +14,7 @@ from typing import Any, ClassVar, Literal, TypeVar, overload
 
 import anyio
 import httpx
+from inspect_ai.model import get_model
 from inspect_ai.util import (
     ExecResult,
     OutputLimitExceededError,
@@ -37,6 +39,7 @@ from inspect_rogue_arena.client import (
     TrialReadyTimeout,
 )
 from inspect_rogue_arena.config import EVAL_MAX_EXEC_SECONDS, RogueArenaSandboxConfig
+from inspect_rogue_arena.preseed import Preseed, check_preseed_targets, load_preseed
 
 logger = logging.getLogger(__name__)
 
@@ -56,21 +59,38 @@ _SHIELD_SECONDS = 60
 _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
 
+def _run_id_from_env() -> str:
+    """A unique run id; ROGUE_ARENA_RUN_ID prefixes it so a launch can find its job.
+
+    Unique even with the prefix: the hub's job create is idempotent on the key,
+    so two sandbox configs in one run must not share it.
+    """
+    prefix = os.environ.get("ROGUE_ARENA_RUN_ID", "").strip()
+    return f"{prefix}-{uuid.uuid4().hex[:12]}" if prefix else str(uuid.uuid4())
+
+
 @dataclass(slots=True)
 class _TaskRuntime:
-    """One eval run's Rogue Arena job for one sandbox config, and its open trials.
+    """One eval run's Rogue Arena job for one sandbox config and model, and its
+    open trials.
 
     Inspect calls ``task_init("startup")`` once per distinct sandbox config and
     ``task_cleanup("shutdown")`` at the end of the run; only ``sample_init``
-    sees the real task name. So every task sharing a config shares this job,
-    and each claim carries its own ``inspectTaskId`` for attribution.
+    sees the real task name. So every task sharing a config and model shares
+    this job, and each claim carries its own ``inspectTaskId`` for attribution.
+    A job carries a single ``model``, so a run over several models has one job
+    per model.
     """
 
     config: RogueArenaSandboxConfig
     client: RogueArenaClient
-    run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    model: str | None = None
+    # The run id becomes the job's clientJobKey (``inspect_<run_id>``).
+    run_id: str = field(default_factory=_run_id_from_env)
     entry: EvalCatalogEntry | None = None
     job_id: str | None = None
+    # The run's preseed, read and checked once before the job is created.
+    preseed: Preseed | None = None
     attempt_number: int = 0
     environments: set[RogueArenaSandboxEnvironment] = field(default_factory=set)
     prepare_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -111,6 +131,21 @@ def _runtime_key(config: RogueArenaSandboxConfig, client: RogueArenaClient) -> s
             f"{client.base_url}\0{client.credential_fingerprint}\0{public_config}"
         ).encode()
     ).hexdigest()
+
+
+def _active_model_name() -> str | None:
+    """The model Inspect is evaluating here, as ``<provider>/<model>``.
+
+    Inspect sets its active model before sandbox startup and again per task, so
+    ``get_model()`` with no arguments returns the model of the samples this
+    context runs (the name the eval log records). None when no model is known,
+    or for Inspect's ``none`` model: the label is optional.
+    """
+    try:
+        name = str(get_model()).strip()
+    except Exception:  # noqa: BLE001 - no model is known: the label is optional
+        return None
+    return None if name in ("", "none/none") else name
 
 
 def _reserved_str(metadata: Mapping[str, object], name: str) -> str | None:
@@ -174,12 +209,32 @@ def select_eval(
     )
 
 
+async def _check_preseed_targets(
+    client: RogueArenaClient, environment_id: str, preseed: Preseed
+) -> None:
+    try:
+        machines = await client.list_eval_machines(environment_id)
+    except RogueArenaApiError as error:
+        if error.status_code in (404, 405, 501):
+            raise RuntimeError(
+                "this Rogue Arena does not support preseed (it lists no eval "
+                f"machines: HTTP {error.status_code}); run without a preseed"
+            ) from error
+        raise
+    check_preseed_targets(preseed, machines)
+
+
 async def _prepare(runtime: _TaskRuntime) -> None:
     async with runtime.prepare_lock:
         if runtime.job_id is not None:
             return
         config = runtime.config
+        # A bad preseed file, or a target the eval does not have, fails the run
+        # before any job or range exists.
+        preseed = load_preseed(config.preseed) if config.preseed else None
         entry = select_eval(await runtime.client.list_evals(), config)
+        if preseed is not None:
+            await _check_preseed_targets(runtime.client, entry.environment_id, preseed)
         client_job_key = f"inspect_{runtime.run_id}"
 
         async def create() -> str:
@@ -190,7 +245,16 @@ async def _prepare(runtime: _TaskRuntime) -> None:
                 wall_clock_limit_seconds=config.max_runtime_seconds,
                 client_job_key=client_job_key,
                 visibility=config.team_visibility,
+                model=runtime.model,
+                keep_range=config.keep_range,
             )
+            if config.keep_range and not job.keep_range:
+                # The hub stored a job that will remove its ranges: never run a
+                # keep-range eval that silently does not keep them.
+                raise RuntimeError(
+                    f"Rogue Arena job {job.id} was created without keep-range; this "
+                    "Rogue Arena does not support keep_range"
+                )
             return job.id
 
         try:
@@ -201,16 +265,62 @@ async def _prepare(runtime: _TaskRuntime) -> None:
             job_id = await create()
         runtime.entry = entry
         runtime.job_id = job_id
+        runtime.preseed = preseed
         logger.info(
-            "Rogue Arena job %s for eval %s (%s): n=%s concurrency=%s "
-            "wall_clock_limit_seconds=%s",
+            "Rogue Arena job %s for eval %s (%s): model=%s n=%s concurrency=%s "
+            "wall_clock_limit_seconds=%s keep_range=%s",
             job_id,
             entry.name,
             entry.environment_id,
+            runtime.model,
             config.max_trials,
             config.concurrency,
             config.max_runtime_seconds,
+            config.keep_range,
         )
+        if preseed is not None:
+            logger.info(
+                "Rogue Arena job %s: each trial runs %s preseed step(s) on its range "
+                "before the model starts",
+                job_id,
+                len(preseed.steps),
+            )
+        if config.keep_range:
+            logger.warning(
+                "Rogue Arena job %s keeps each scored trial's range up, billed like "
+                "any lab, until you close it: rogue-arena-inspect close %s",
+                job_id,
+                job_id,
+            )
+
+
+async def _cleanup_runtime(runtime: _TaskRuntime, cleanup: bool) -> None:
+    """End one job's open trials and cancel it, or leave them for inspection."""
+    leftovers = tuple(runtime.environments)
+    if not cleanup:
+        for environment in leftovers:
+            await environment._stop_heartbeat()
+        logger.info(
+            "Rogue Arena job %s and %d open trial(s) left for inspection; "
+            "Rogue Arena reaps them when their lease lapses",
+            runtime.job_id,
+            len(leftovers),
+        )
+        return
+    try:
+        for environment in leftovers:
+            try:
+                await environment._close(EvalTrialOutcome.CANCELLED)
+            except Exception as error:  # noqa: BLE001 - best-effort cleanup
+                logger.warning(
+                    "Failed to close Rogue Arena trial %s during task cleanup: %s: %s",
+                    environment.trial_id,
+                    type(error).__name__,
+                    error,
+                )
+    finally:
+        if runtime.job_id is not None:
+            await _cancel_job(runtime.client, runtime.job_id)
 
 
 def _log_claim_failure(sample_id: str, error: BaseException) -> None:
@@ -340,7 +450,8 @@ class RogueArenaSandboxEnvironment(SandboxEnvironment):
     for a slot.
     """
 
-    _runtimes: ClassVar[dict[str, _TaskRuntime]] = {}
+    # Keyed by (the config's runtime key, the active model's name).
+    _runtimes: ClassVar[dict[tuple[str, str | None], _TaskRuntime]] = {}
     _runtimes_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
@@ -437,13 +548,14 @@ class RogueArenaSandboxEnvironment(SandboxEnvironment):
     @classmethod
     def _get_or_create_runtime(
         cls, config: RogueArenaSandboxConfig
-    ) -> tuple[str, _TaskRuntime]:
+    ) -> tuple[tuple[str, str | None], _TaskRuntime]:
         client = RogueArenaClient.from_env()
-        key = _runtime_key(config, client)
+        model = _active_model_name()
+        key = (_runtime_key(config, client), model)
         with cls._runtimes_lock:
             runtime = cls._runtimes.get(key)
             if runtime is None:
-                runtime = _TaskRuntime(config=config, client=client)
+                runtime = _TaskRuntime(config=config, client=client, model=model)
                 cls._runtimes[key] = runtime
         return key, runtime
 
@@ -481,8 +593,6 @@ class RogueArenaSandboxEnvironment(SandboxEnvironment):
         # Waiting for a slot is ordinary queueing, so it is unbounded
         # (max_wait_seconds bounds provisioning, not the queue).
         await runtime.trial_slots.acquire()
-        # The hub's wall clock runs from the claim, provisioning included.
-        claimed_at = time.monotonic()
         try:
             trial = await runtime.client.claim_trial(
                 job_id,
@@ -497,8 +607,12 @@ class RogueArenaSandboxEnvironment(SandboxEnvironment):
                 inspect_eval_set_id=_reserved_str(metadata, "__eval_set_id__"),
                 inspect_task_id=task_name,
                 sandbox_name=entry.name or entry.environment_id,
-                max_wait_seconds=resolved.ready_wait_seconds,
+                # A preseed runs before the trial is ready, so its steps' time
+                # adds to the provisioning backstop.
+                max_wait_seconds=resolved.max_wait_seconds
+                + (runtime.preseed.wait_seconds if runtime.preseed else 0),
                 poll_interval_seconds=resolved.poll_interval_seconds,
+                preseed=runtime.preseed,
             )
         except BaseException as error:
             runtime.trial_slots.release()
@@ -508,7 +622,9 @@ class RogueArenaSandboxEnvironment(SandboxEnvironment):
             runtime.client,
             trial,
             runtime=runtime,
-            deadline=claimed_at + resolved.max_runtime_seconds,
+            # The hub's wall clock starts when the range is ready, so build time
+            # never spends the model's.
+            deadline=time.monotonic() + resolved.max_runtime_seconds,
         )
         runtime.environments.add(sandbox)
         sandbox._start_heartbeat()
@@ -542,40 +658,25 @@ class RogueArenaSandboxEnvironment(SandboxEnvironment):
         config: SandboxEnvironmentConfigType | None,
         cleanup: bool,
     ) -> None:
-        del task_name  # "shutdown": the runtime is keyed by config
+        del task_name  # "shutdown": the runtimes are keyed by config and model
         resolved = _as_config(config)
         client = RogueArenaClient.from_env()
-        key = _runtime_key(resolved, client)
+        config_key = _runtime_key(resolved, client)
+        # Inspect cleans up once per config, so every model's job goes here, and
+        # only those: the registry holds just the jobs this process created.
         with cls._runtimes_lock:
-            runtime = cls._runtimes.pop(key, None)
-        if runtime is None:
-            return
-        leftovers = tuple(runtime.environments)
-        if not cleanup:
-            for environment in leftovers:
-                await environment._stop_heartbeat()
-            logger.info(
-                "Rogue Arena job %s and %d open trial(s) left for inspection; "
-                "Rogue Arena reaps them when their lease lapses",
-                runtime.job_id,
-                len(leftovers),
-            )
-            return
-        try:
-            for environment in leftovers:
-                try:
-                    await environment._close(EvalTrialOutcome.CANCELLED)
-                except Exception as error:  # noqa: BLE001 - best-effort cleanup
-                    logger.warning(
-                        "Failed to close Rogue Arena trial %s during task cleanup: "
-                        "%s: %s",
-                        environment.trial_id,
-                        type(error).__name__,
-                        error,
-                    )
-        finally:
-            if runtime.job_id is not None:
-                await _cancel_job(runtime.client, runtime.job_id)
+            keys = [key for key in cls._runtimes if key[0] == config_key]
+            runtimes = [cls._runtimes.pop(key) for key in keys]
+        for runtime in runtimes:
+            try:
+                await _cleanup_runtime(runtime, cleanup)
+            except Exception as error:  # noqa: BLE001 - clean up the other jobs
+                logger.warning(
+                    "Failed to clean up Rogue Arena job %s: %s: %s",
+                    runtime.job_id,
+                    type(error).__name__,
+                    error,
+                )
 
     # --- lease --------------------------------------------------------------
 

@@ -65,8 +65,10 @@ jobs:
           PY
 
       - name: Build sdist and wheel
+        # build is pinned (as hatchling is in pyproject) so a release build is
+        # reproducible; 1.6.1 built 0.5.0's published artifacts.
         run: |
-          python -m pip install --upgrade build
+          python -m pip install build==1.6.1
           python -m build
 
       - name: Publish to PyPI (Trusted Publishing / OIDC)

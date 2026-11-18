@@ -6,17 +6,28 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from inspect_rogue_arena.preseed import PRESEED_ENV
+
 # Mirrors the hub's heartbeat grace period. A heartbeat must
 # land inside this window or the server lets the lease lapse and reaps the trial.
 EVAL_HEARTBEAT_GRACE_SECONDS = 900
 # Mirrors the hub's hard exec ceiling.
 EVAL_MAX_EXEC_SECONDS = 4 * 60 * 60
-# The provisioning backstop's floor: a cold build of a large scenario regularly
-# takes over 15 minutes.
-DEFAULT_MAX_WAIT_SECONDS = 2 * 60 * 60
-# How far the default backstop reaches past the trial's wall clock, so the hub's
-# own wall-clock expiry (on its next maintenance pass) always lands first.
-READY_WAIT_WALL_CLOCK_MARGIN_SECONDS = 5 * 60
+# The provisioning backstop: the hub's 3-hour limit on a build, plus 5 minutes so
+# the hub's own answer (and its reason) always lands first.
+DEFAULT_MAX_WAIT_SECONDS = 3 * 60 * 60 + 5 * 60
+
+
+# The prompt `launch --prompt-level` chose, read by a task through task_prompt().
+PROMPT_ENV = "ROGUE_ARENA_PROMPT"
+
+# `launch --keep-range` sets it; any `inspect eval` run can set it too (true/false).
+KEEP_RANGE_ENV = "ROGUE_ARENA_KEEP_RANGE"
+
+
+def task_prompt(default: str) -> str:
+    """The model's task prompt: the one ``launch --prompt-level`` chose, else ``default``."""
+    return os.environ.get(PROMPT_ENV, "").strip() or default
 
 
 class RogueArenaSandboxConfig(BaseModel):
@@ -33,10 +44,12 @@ class RogueArenaSandboxConfig(BaseModel):
     # One selector: an eval environment id (uuid) or a unique name matched
     # against `list_evals()`.
     eval: str | None = None
-    # The backstop on a claimed trial's provisioning (see ready_wait_seconds).
-    # None (the default) derives it from the wall clock. It does not bound the
-    # wait for a concurrency slot.
-    max_wait_seconds: float | None = Field(default=None, gt=0)
+    # The backstop on a claimed trial's provisioning. The client keeps waiting
+    # while the hub reports the trial provisioning; the hub judges build progress
+    # itself and ends a build that stalls or runs too long, so the default only
+    # bounds a wait the hub never ends. It does not bound the wait for a
+    # concurrency slot.
+    max_wait_seconds: float = Field(default=DEFAULT_MAX_WAIT_SECONDS, gt=0)
     max_runtime_seconds: int = Field(default=3600, ge=60, le=86_400)
     poll_interval_seconds: float = Field(default=2.0, gt=0, le=60)
     heartbeat_interval_seconds: float = Field(
@@ -52,28 +65,17 @@ class RogueArenaSandboxConfig(BaseModel):
     # recorded, but the hub refuses a member's read while the run is live). The
     # default keeps a non-team run's feed readable.
     team_visibility: Literal["shared_sight", "communicate_only"] = "shared_sight"
+    # Keep-range (opt-in, stored on the hub job at create): a trial that ends
+    # scored leaves its range up, billed and idled like any lab, until you close
+    # it with `rogue-arena-inspect close <run-id>` (or Remove in Rogue Arena).
+    # Off by default: every range is removed when its trial ends.
+    keep_range: bool = False
+    # Preseed (opt-in): a preseed file (YAML/JSON) of bash or PowerShell steps
+    # Rogue Arena runs on each trial's range before the model starts (see
+    # inspect_rogue_arena.preseed). The trial's wall clock starts after them.
+    preseed: str | None = None
 
-    @property
-    def ready_wait_seconds(self) -> float:
-        """How long the client waits for a claimed trial to become ready.
-
-        The client keeps waiting while the hub reports the trial
-        provisioning: the hub judges build progress itself and expires a copy
-        that stops progressing or outruns the trial's wall clock, so this only
-        bounds a wait the hub never ends. ``max_wait_seconds`` when set; else
-        the longer of 2 hours and the wall clock plus 5 minutes, so the client
-        never gives up on a build the hub would still allow.
-        """
-        if self.max_wait_seconds is not None:
-            return self.max_wait_seconds
-        return float(
-            max(
-                DEFAULT_MAX_WAIT_SECONDS,
-                self.max_runtime_seconds + READY_WAIT_WALL_CLOCK_MARGIN_SECONDS,
-            )
-        )
-
-    @field_validator("eval", mode="before")
+    @field_validator("eval", "preseed", mode="before")
     @classmethod
     def _strip_optional_string(cls, value: Any) -> Any:
         if value is None or not isinstance(value, str):
@@ -97,6 +99,8 @@ class RogueArenaSandboxConfig(BaseModel):
             "sync_exec_ceiling_seconds": "ROGUE_ARENA_SYNC_EXEC_CEILING_SECONDS",
             "max_trials": "ROGUE_ARENA_MAX_TRIALS",
             "concurrency": "ROGUE_ARENA_CONCURRENCY",
+            "keep_range": KEEP_RANGE_ENV,
+            "preseed": PRESEED_ENV,
         }
         env_values: dict[str, Any] = {}
         for field_name, env_name in env_map.items():

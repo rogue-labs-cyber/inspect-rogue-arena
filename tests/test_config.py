@@ -39,6 +39,36 @@ class RogueArenaConfigTests(unittest.TestCase):
         self.assertEqual(resolved.max_runtime_seconds, 1800)
         self.assertEqual(resolved.concurrency, 3)
 
+    def test_keep_range_is_off_by_default_and_comes_from_config_or_env(self) -> None:
+        self.assertFalse(
+            RogueArenaSandboxConfig.from_sources(None, environ={}).keep_range
+        )
+        self.assertTrue(
+            RogueArenaSandboxConfig.from_sources(
+                None, environ={"ROGUE_ARENA_KEEP_RANGE": "true"}
+            ).keep_range
+        )
+        self.assertFalse(
+            RogueArenaSandboxConfig.from_sources(
+                None, environ={"ROGUE_ARENA_KEEP_RANGE": "false"}
+            ).keep_range
+        )
+        # An explicit sandbox config value wins over the environment.
+        self.assertFalse(
+            RogueArenaSandboxConfig.from_sources(
+                {"keep_range": False}, environ={"ROGUE_ARENA_KEEP_RANGE": "true"}
+            ).keep_range
+        )
+        self.assertTrue(
+            RogueArenaSandboxConfig.from_sources(
+                {"keep_range": True}, environ={}
+            ).keep_range
+        )
+        with self.assertRaises(ValidationError):
+            RogueArenaSandboxConfig.from_sources(
+                None, environ={"ROGUE_ARENA_KEEP_RANGE": "sometimes"}
+            )
+
     def test_team_visibility_defaults_and_comes_from_the_team_file(self) -> None:
         import tempfile
         from pathlib import Path

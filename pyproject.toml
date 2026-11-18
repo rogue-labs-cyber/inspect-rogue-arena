@@ -1,6 +1,6 @@
 [project]
 name = "inspect-rogue-arena"
-version = "0.5.1"
+version = "0.6.0"
 description = "Inspect sandbox provider for running AI model evals on Rogue Arena cyber ranges"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,6 +35,8 @@ dependencies = [
     # Supported Inspect versions: >=0.3.260,<0.3.274.
     "inspect_ai>=0.3.260,<0.3.274",
     "pydantic>=2.0",
+    # imported directly: team configs and preseed files are YAML
+    "pyyaml>=6",
 ]
 
 [project.optional-dependencies]
@@ -48,11 +50,6 @@ anthropic = ["anthropic>=0.40"]
 google = ["google-genai>=1.0"]
 # Everything above, for a team run that mixes providers.
 all-providers = ["openai>=1.0", "anthropic>=0.40", "google-genai>=1.0"]
-
-[dependency-groups]
-# test-only: tests/test_sandbox.py parses the example run config with PyYAML.
-# `uv sync` installs it.
-dev = ["pyyaml>=6"]
 
 [project.urls]
 Homepage = "https://github.com/rogue-labs-cyber/inspect-rogue-arena"
@@ -78,13 +75,16 @@ packages = ["src/inspect_rogue_arena"]
 
 # The sdist ships the package (with its examples and py.typed marker), the
 # tests, the README, LICENSE, NOTICE and this pyproject. The build backend also
-# adds the project's .gitignore.
+# adds the project's .gitignore. Paths are anchored to the project root, so a
+# README elsewhere never matches, and scripts/ (with its own tests) stays out
+# even when the sdist is built from the internal repository.
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/inspect_rogue_arena",
-    "tests",
-    "README.md",
-    "LICENSE",
-    "NOTICE",
-    "pyproject.toml",
+    "/src/inspect_rogue_arena",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/pyproject.toml",
 ]
+exclude = ["/scripts"]
